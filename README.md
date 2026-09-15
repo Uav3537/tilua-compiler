@@ -1,30 +1,36 @@
-# luaut-build
+# @tilua/compiler
 
-Compiles a [luaut](https://www.npmjs.com/package/luaut-parser) project to one
-Luau file. Each file is parsed by `luaut-parser`, its AST lowered to a
-`luau-parser` AST, and that AST printed by `luau-parser`.
+Compiles a [tilua](https://marketplace.visualstudio.com/search?term=tilua)
+project to one Luau file. Each file is parsed by
+[`@tilua/parser`](https://www.npmjs.com/package/@tilua/parser), its AST lowered
+to a `luau-parser` AST, and that AST printed by `luau-parser`.
 
 ```bash
-npm i -D luaut-build
-npx luaut-build src/main.luaut --out build/main.luau
+npm i -D @tilua/compiler @tilua-types/roblox
+npx tilua src/main.tilua --out build/main.luau
 ```
 
 ```
-luaut-build <entry> [--out <file>] [--config <luaut.config.json>] [--noCheck]
+tilua <entry> [--out <file>] [--config <tilua.config.json>] [--noCheck] [--target luau|lua51]
 ```
 
-Every module the entry imports is bundled in. Type errors are checked against
-the config's `types`: they are reported, but the bundle is still written
-(`--noCheck` skips the check). A syntax error or a missing module stops the
-build.
+Every module the entry imports is bundled in. Problems are reported as
+`file:line:column message`. Type errors are checked against the config's
+`types`: they are reported, but the bundle is still written (`--noCheck` skips
+the check). A syntax error or a missing module stops the build.
+
+Without `--out`, the entry's own path with `.luau` is written. Without
+`--config`, the nearest `tilua.config.json` above the entry applies — see the
+[`@tilua/parser`](https://www.npmjs.com/package/@tilua/parser) README for what
+goes in it.
 
 ## API
 
 ```ts
-import { bundle, compile } from "luaut-build"
+import { bundle, compile } from "@tilua/compiler"
 
 const result = await bundle({
-    entry: "src/main.luaut",
+    entry: "src/main.tilua",
     // A config file's path, or its contents:
     config: { types: ["roblox"], paths: { "@shared/*": ["src/shared/*"] } },
 })
@@ -33,11 +39,11 @@ result.diagnostics   // { file, line, column, message, category: "syntax" | "mod
 
 // One file, no imports. The config is optional here too, and brings the same
 // type libraries — including what they lower.
-const one = await compile("const names = [1]\n", "luaut.config.json")
+const one = await compile("const names = [1]\n", "tilua.config.json")
 ```
 
-`config` is typed `string | LuautConfigJson`. Left out, the nearest
-`luaut.config.json` above the entry applies — and for `compile`, nothing at
+`config` is typed `string | TiluaConfigJson`. Left out, the nearest
+`tilua.config.json` above the entry applies — and for `compile`, nothing at
 all.
 
 Both are `async`: a type library may ship its own lowering, which is a
@@ -45,7 +51,7 @@ JavaScript module the build loads.
 
 ## What becomes what
 
-| luaut | Luau |
+| tilua | Luau |
 |---|---|
 | `const { a, b } = value` | `local a, b = value.a, value.b` |
 | `const [x, ...rest] = list` | `local x = list[1]; local rest = table.move(list, 2, #list, 1, {})` |
@@ -58,7 +64,7 @@ JavaScript module the build loads.
 | `f()?.b?:m(x)` | a function call that keeps each link in a local, so every link runs once, in order, and none after a nil |
 | `function f(n = 1, { x })` | `function f(n, arg) if n == nil then n = 1 end local x = arg.x ...` |
 | `const` / `let` | `local` |
-| `class C ... end` | one table for the class, one per instance — see below |
+| `class C { … }` | one table for the class, one per instance — see below |
 | `new C(x)` | `C.new(x)` |
 | `[...]` | `{...}` — the varargs as an array |
 | `function f(a, ...rest)` | `function f(a, ...) local rest = {...}` |
@@ -69,27 +75,29 @@ JavaScript module the build loads.
 
 ## Classes
 
-`class ... end` is sugar over the Lua idiom, and it lowers to that idiom and
-nothing more: one table per class, holding its methods and its statics, and
-one table per instance whose metatable is the class. An instance reaches the
-class directly — nothing is copied per instance.
+`class` is sugar over the Lua idiom, and it lowers to that idiom and nothing
+more: one table per class, holding its methods and its statics, and one table
+per instance whose metatable is the class. An instance reaches the class
+directly — nothing is copied per instance.
 
-```luau
-class Dog extends Animal
+```ts
+class Dog extends Animal {
     breed = "corgi"
-    constructor(name: string)
+
+    constructor(name: string) {
         super(name)
-    end
-    function speak(): string
-        return super.speak() .. " woof"
-    end
-end
+    }
+
+    function speak(): string {
+        return `${super.speak()} woof`
+    }
+}
 ```
 
 ```lua
-local Dog = luaut_class(Animal)
+local Dog = tilua_class(Animal)
 function Dog.speak(this)
-    return Animal.speak(this) .. " woof"
+    return ("%s woof"):format(tostring(Animal.speak(this)))
 end
 function Dog.__init(this, name)
     Animal.__init(this, name)      -- super(name)
@@ -100,7 +108,7 @@ function Dog.new(...)
     Dog.__init(this, ...)
     return this
 end
-luaut_accessors(Dog)
+tilua_accessors(Dog)
 ```
 
 `__init` is what `super(...)` calls: it runs the constructor on an instance
@@ -113,34 +121,35 @@ they live on the class table: `ClassObject`, which an instance reads through
 its metatable to reach its own class, and `ParentClass`, which a class reads
 to reach the one it extends.
 
-A class written as a value (`const Counter = class ... end`) is the same code,
+A class written as a value (`const Counter = class { … }`) is the same code,
 inside a function that runs where the class is written and hands the table
 back — an expression has no room for statements. Type parameters leave no
 trace at all: `Box<number>` and `Box<string>` compile to the one `Box`.
 
 Two helpers go in at the top of any file that declares a class.
-`luaut_class(base)` makes the table, points `__index` at it, and chains it to
+`tilua_class(base)` makes the table, points `__index` at it, and chains it to
 the base — for the statics, and for the getter and setter tables. Getters and
-setters are what the second helper is for: `luaut_accessors(class)` replaces
+setters are what the second helper is for: `tilua_accessors(class)` replaces
 `__index` with a function *only* when the class or one it extends declares an
 accessor. Every other class keeps the plain `__index = class` lookup, which is
 the fast one.
 
 ## What a type library lowers
 
-The compiler lowers luaut. What a *library* gives a value, the library also
+The compiler lowers tilua. What a *library* gives a value, the library also
 says how to run: `names:filter(f)` is a call to a function because
-`@luaut/lua` declares the method and ships the Luau behind it.
+[`@tilua-types/lua`](https://www.npmjs.com/package/@tilua-types/lua) declares
+the method and ships the Luau behind it.
 
-A library names a module in its package.json (`"luaut": { "lowering":
+A library names a module in its package.json (`"tilua": { "lowering":
 "lowering.mjs" }`) whose default export answers for a call. The contract is
-`LoweringPlugin`, declared in luaut-parser and re-exported here, so a library
-can be checked against it — by JSDoc, or in TypeScript — without depending on
-the compiler:
+`LoweringPlugin`, declared in `@tilua/parser` and re-exported here, so a
+library can be checked against it — by JSDoc, or in TypeScript — without
+depending on the compiler:
 
 ```js
 // @ts-check
-/** @type {import("luaut-parser").LoweringPlugin} */
+/** @type {import("@tilua/parser").LoweringPlugin} */
 const plugin = {
     runtime: { array: "local __NAME__ = {}\nfunction __NAME__.filter(t, test) ... end" },
     methodCall({ method, receiver, use }) {
@@ -153,7 +162,7 @@ const plugin = {
 export default plugin
 ```
 
-`receiver` is the luaut type the analyzer worked out; `use(key)` names the
+`receiver` is the tilua type the analyzer worked out; `use(key)` names the
 table from `runtime`, emitted once at the top of the output and only if a call
 needed it; the receiver becomes the call's first argument unless
 `passReceiver: false`. The last library loaded is asked first, and `undefined`
@@ -213,11 +222,11 @@ Modules follow ES module rules, including when they import each other:
   import used only as a type. A module reached only that way is left out of
   the bundle and never runs.
 
-## Tests
+## Development
 
 ```bash
-npm test
+npm test          # with a Luau interpreter on the PATH (or named by LUAU),
+                  # the tests also run each bundle and check its output
+npm run build
+npm run typecheck
 ```
-
-With a Luau interpreter on the `PATH` (or named by `LUAU`), the tests also run
-each bundle and check its output.

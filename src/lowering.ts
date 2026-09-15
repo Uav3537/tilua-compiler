@@ -1,28 +1,28 @@
 /**
  * Loading the lowering a type library brings with it.
  *
- * The compiler lowers luaut itself — `import`, `export`, `a ? b : c`, `?.`,
+ * The compiler lowers tilua itself — `import`, `export`, `a ? b : c`, `?.`,
  * destructuring, spreads, template strings: the things the language means on
  * its own. Everything a *library* gives a value it must also say how to run:
- * `names:filter(f)` is a call to a function because `@luaut/lua` declares the
+ * `names:filter(f)` is a call to a function because `@tilua-types/lua` declares the
  * method and ships the Luau behind it, not because the compiler has heard of
  * `filter`.
  *
  * A library names its module in package.json:
  *
- *     "luaut": { "types": "index.d.luaut", "lowering": "lowering.mjs" }
+ *     "tilua": { "types": "index.d.tilua", "lowering": "lowering.mjs" }
  *
  * and the module's default export is a `LoweringPlugin` (declared in
- * luaut-parser, and re-exported here). The compiler asks each plugin, the
+ * @tilua/parser, and re-exported here). The compiler asks each plugin, the
  * last library loaded first, and takes the first answer.
  */
 import { pathToFileURL } from "node:url"
-import type { LoweringPlugin } from "luaut-parser"
+import type { LoweringPlugin } from "@tilua/parser"
 
-// The contract itself is declared in luaut-parser, so a type library can be
-// written against it with `import type { LoweringPlugin } from "luaut-parser"`
+// The contract itself is declared in @tilua/parser, so a type library can be
+// written against it with `import type { LoweringPlugin } from "@tilua/parser"`
 // — without depending on the compiler that calls it.
-export type { LoweringPlugin, MethodCall, MethodLowering } from "luaut-parser"
+export type { LoweringPlugin, MethodCall, MethodLowering } from "@tilua/parser"
 
 export interface LoadedLowering {
     readonly plugin: LoweringPlugin

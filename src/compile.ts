@@ -1,8 +1,8 @@
 /**
- * One luaut file -> Luau, on its own: no imports, no exports. A project goes
+ * One tilua file -> Luau, on its own: no imports, no exports. A project goes
  * through `bundle` instead.
  *
- * A `config` — a `luaut.config.json` path, or the same JSON inline — brings
+ * A `config` — a `tilua.config.json` path, or the same JSON inline — brings
  * the project's type libraries: their definitions type the file, and what
  * they lower (`names:filter(f)`) is lowered. Without one the file is compiled
  * against nothing, and a call a library would have explained stays a plain
@@ -10,7 +10,7 @@
  */
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
-import { parse, analyzeScopes, analyzeTypes, resolveTypeLibraries, ParseError, LexError } from "luaut-parser"
+import { parse, analyzeScopes, analyzeTypes, resolveTypeLibraries, ParseError, LexError } from "@tilua/parser"
 import { print } from "luau-parser"
 import { lower } from "./lower.js"
 import { loadLowerings } from "./lowering.js"
@@ -41,13 +41,13 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
         throw error
     }
 
-    // Reassigning a `const` is an error in luaut; Luau would run it anyway.
+    // Reassigning a `const` is an error in tilua; Luau would run it anyway.
     const scopes = analyzeScopes(program)
     const diagnostics: Diagnostic[] = scopes.diagnostics.map(d => ({
         message: d.message, line: d.node.line.start, column: d.node.column.start,
     }))
 
-    const { config: resolved, problems } = resolveConfig(config, resolve("main.luaut"))
+    const { config: resolved, problems } = resolveConfig(config, resolve("main.tilua"))
     const libraries = resolved ? resolveTypeLibraries(resolved) : { files: [], lowerings: [], problems: [] }
     const { lowerings, problems: loweringProblems } = await loadLowerings(libraries.lowerings)
     for (const p of [...problems, ...libraries.problems]) {
@@ -59,6 +59,8 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
     const lowered = lower(program, scopes, {
         types: analyzeTypes(program, scopes, { libs, diagnostics: false }),
         lowerings,
+        target: resolved?.target,
+        source,
     })
     diagnostics.push(...lowered.diagnostics)
     if (diagnostics.length) return { diagnostics }

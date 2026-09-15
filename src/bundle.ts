@@ -1,5 +1,5 @@
 /**
- * A luaut project -> one Luau file.
+ * A tilua project -> one Luau file.
  *
  * Roblox's `require` takes an Instance, so a bundle cannot use it between its
  * own modules. Instead every module becomes an entry in one table, loaded by a
@@ -44,11 +44,12 @@ import { dirname, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries,
     directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, ParseError, LexError,
-    type ModuleExports, type Program, type ScopeAnalysis, type LuautConfig, type TypeAnalysis, type Directives,
-} from "luaut-parser"
-import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
+    type ModuleExports, type Program, type ScopeAnalysis, type TiluaConfig, type TypeAnalysis, type Directives,
+} from "@tilua/parser"
+import { parse as parseLuau, parseExpressionFromSource, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
-import { lower, type ModuleInfo } from "./lower.js"
+import { lower, type ModuleInfo, type Target } from "./lower.js"
+import { buildLineMap, lineMapSource, type Origin } from "./linemap.js"
 import { loadLowerings } from "./lowering.js"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
@@ -56,7 +57,7 @@ import { Names } from "./names.js"
 export interface BundleOptions {
     /** The file the bundle runs. */
     readonly entry: string
-    /** A `luaut.config.json` path or contents. Default: the nearest config above the entry. */
+    /** A `tilua.config.json` path or contents. Default: the nearest config above the entry. */
     readonly config?: ConfigInput
     /** The project folder. Modules are named by their path from it, and an
      *  inline config's relative paths resolve from it. Default: the config
@@ -64,6 +65,8 @@ export interface BundleOptions {
     readonly root?: string
     /** Check types against the config's `types` too. Default: true. */
     readonly typeCheck?: boolean
+    /** Which Lua the output must run on. Overrides the config's `target`. */
+    readonly target?: Target
 }
 
 export interface BundleDiagnostic {
@@ -90,6 +93,9 @@ export interface BundleResult {
 interface SourceModule {
     readonly file: string
     readonly name: string
+    /** The file's own text. `console:log` shows a function as the code it was
+     *  written as, which only the text has. */
+    readonly text: string
     readonly program: Program
     readonly scopes: ScopeAnalysis
 }
@@ -102,7 +108,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     for (const p of problems) diagnostics.push({ file: p.file, message: p.message, line: p.line ?? 1, column: p.column ?? 1, category: "config" })
 
     const root = resolve(options.root ?? config?.directory ?? dirname(entry))
-    const nameOf = (file: string): string => relative(root, file).replace(/\\/g, "/").replace(/\.luaut$/, "")
+    const nameOf = (file: string): string => relative(root, file).replace(/\\/g, "/").replace(/\.tilua$/, "")
 
     // Every module the entry reaches through an import, types included.
     const sources = new Map<string, SourceModule>()
@@ -111,23 +117,24 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     while (queue.length) {
         const file = queue.shift()!
         if (sources.has(file)) continue
-        const program = parseFile(file, diagnostics, directives)
-        if (!program) return { modules: [], diagnostics }
+        const parsed = parseFile(file, diagnostics, directives)
+        if (!parsed) return { modules: [], diagnostics }
+        const { program, text } = parsed
         const scopes = analyzeScopes(program)
         for (const d of scopes.diagnostics) {
             diagnostics.push({ file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "scope" })
         }
-        sources.set(file, { file, name: nameOf(file), program, scopes })
+        sources.set(file, { file, name: nameOf(file), text, program, scopes })
         for (const specifier of importedSpecifiers(program)) {
             const target = resolveModulePath(file, specifier, config)
-            if (target && !target.endsWith(".d.luaut")) queue.push(target)
+            if (target && !target.endsWith(".d.tilua")) queue.push(target)
         }
     }
 
     // Types are needed either way: lowering reads them (`for x in list`).
     const analysis = analyzeModules([...sources.values()], config)
 
-    // What the project's type libraries lower. The compiler lowers luaut
+    // What the project's type libraries lower. The compiler lowers tilua
     // itself; a call written against a library's types is the library's to
     // explain, and this is where those explanations come from.
     const { lowerings, problems: loweringProblems } = await loadLowerings(analysis.lowerings)
@@ -142,6 +149,9 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const G = names.fresh("G")
     const requireExpression = luau.member(luau.identifier(G), "require")
     const modules = new Map<string, { name: string; statements: LuauStatement[]; exportsName: string; info: ModuleInfo }>()
+    // Where every emitted statement was written, across all the modules. The
+    // bundle is one file, so this is the only way back to the project.
+    const origins = new WeakMap<LuauStatement, Origin>()
     const pending = [entry]
     while (pending.length) {
         const file = pending.shift()!
@@ -151,18 +161,26 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
             names,
             types: analysis.types.get(file),
             lowerings,
+            target: options.target ?? config?.target,
+            source: source.text,
             module: {
                 name: source.name,
                 require: requireExpression,
+                lines: `${G}.lines`,
                 resolve: specifier => {
                     const target = resolveModulePath(file, specifier, config)
-                    if (!target || target.endsWith(".d.luaut") || !sources.has(target)) return undefined
+                    if (!target || target.endsWith(".d.tilua") || !sources.has(target)) return undefined
                     pending.push(target)
                     return sources.get(target)!.name
                 },
             },
         })
         for (const d of lowered.diagnostics) diagnostics.push({ file, ...d, category: "module" })
+        const shown = relative(root, file).replace(/\\/g, "/")
+        for (const statement of allStatements(lowered.statements)) {
+            const line = lowered.origins.get(statement)
+            if (line !== undefined) origins.set(statement, { file: shown, line })
+        }
         modules.set(file, {
             name: source.name,
             statements: lowered.statements,
@@ -171,7 +189,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         })
     }
 
-    // `--@luaut-nocheck`, `--@luaut-ignore` and `--@luaut-expect-error` apply
+    // `--@tilua-nocheck`, `--@tilua-ignore` and `--@tilua-expect-error` apply
     // to scope and type errors, file by file.
     for (const [file, fileDirectives] of directives) {
         const semantic = diagnostics.filter(d => d.file === file && (d.category === "scope" || d.category === "type"))
@@ -203,7 +221,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const modulesTable = assignment.type === "AssignmentStatement" && assignment.values[0].type === "TableExpression"
         ? (assignment.values[0].fields.find(f => f.type === "TableFieldNamed" && f.name.name === "modules") as { value: TableExpression } | undefined)?.value
         : undefined
-    if (!modulesTable) throw new Error("luaut-build: the bundle runtime has no modules table")
+    if (!modulesTable) throw new Error("@tilua/compiler: the bundle runtime has no modules table")
     for (const module of modules.values()) {
         const { names: exported, links, stars } = module.info
         const fields: TableField[] = []
@@ -221,6 +239,17 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     }
     const start = luau.call(requireExpression, [luau.string(sources.get(entry)!.name)])
     program.body.statements.push(modules.get(entry)!.info.exports ? luau.returns([start]) : luau.callStatement(start))
+
+    // The map is read off the printed text, so it can only be built once that
+    // text exists. Its own assignment then goes in immediately before the entry
+    // call — after every module body, so nothing the map describes moves.
+    const map = buildLineMap(program, parseLuau(print(program)), origins)
+    if (map.size) {
+        program.body.statements.splice(program.body.statements.length - 1, 0, luau.assign(
+            [luau.member(luau.identifier(G), "lines")],
+            [parseExpressionFromSource(lineMapSource(map))],
+        ))
+    }
 
     return { code: print(program) + "\n", modules: moduleNames, diagnostics }
 }
@@ -280,7 +309,7 @@ ${G} = {
 `
 }
 
-function parseFile(file: string, diagnostics: BundleDiagnostic[], directives: Map<string, Directives>): Program | undefined {
+function parseFile(file: string, diagnostics: BundleDiagnostic[], directives: Map<string, Directives>): { program: Program; text: string } | undefined {
     let text: string
     try {
         text = readFileSync(file, "utf8")
@@ -291,7 +320,7 @@ function parseFile(file: string, diagnostics: BundleDiagnostic[], directives: Ma
     try {
         const program = parse(text)
         directives.set(file, directivesOf(text))
-        return program
+        return { program, text }
     } catch (error) {
         if (error instanceof ParseError || error instanceof LexError) {
             const { line, column } = error as unknown as { line: number; column: number }
@@ -312,7 +341,7 @@ function importedSpecifiers(program: Program): string[] {
 /** Every module's types, and its type errors, against the config's type libraries. */
 function analyzeModules(
     modules: SourceModule[],
-    config: LuautConfig | undefined,
+    config: TiluaConfig | undefined,
 ): {
     types: Map<string, TypeAnalysis>
     diagnostics: BundleDiagnostic[]
@@ -377,4 +406,22 @@ function analyzeModules(
         }
     }
     return { types: analyses, diagnostics: out, lowerings: [...libraries.lowerings] }
+}
+
+/** Every statement inside `statements`, nested ones included. */
+function allStatements(statements: readonly LuauStatement[]): LuauStatement[] {
+    const out: LuauStatement[] = []
+    const visit = (value: unknown): void => {
+        if (!value || typeof value !== "object") return
+        if (Array.isArray(value)) return void value.forEach(visit)
+        const record = value as Record<string, unknown>
+        if (typeof record.type === "string" && record.type.endsWith("Statement")) {
+            out.push(value as LuauStatement)
+        }
+        for (const [key, child] of Object.entries(record)) {
+            if (key !== "line" && key !== "column") visit(child)
+        }
+    }
+    visit(statements)
+    return out
 }

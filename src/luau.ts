@@ -80,6 +80,13 @@ export const ifThen = (condition: L.Expression, body: L.Statement[]): L.IfStatem
 
 export const doBlock = (body: L.Statement[]): L.DoStatement => ({ type: "DoStatement", body: block(body), ...span() })
 
+export const breakStatement = (): L.BreakStatement => ({ type: "BreakStatement", ...span() })
+
+/** `repeat <body> until <condition>`. With `until true` it runs once, which is
+ *  how a `continue` is built in a Lua without one. */
+export const repeatUntil = (body: L.Statement[], condition: L.Expression): L.RepeatStatement =>
+    ({ type: "RepeatStatement", body: block(body), condition, ...span() })
+
 export const genericFor = (variables: string[], iterators: L.Expression[], body: L.Statement[]): L.GenericForStatement => ({
     type: "GenericForStatement",
     variables: variables.map(name => ({ type: "TypedIdentifier", name, ...span() })),
@@ -117,8 +124,8 @@ export const program = (statements: L.Statement[]): L.Program => ({ type: "Progr
 // Names
 // ------------------------------------------------------------
 
-/** Luau's reserved words. luaut reserves most of them too — `local` is the
- *  exception, so a luaut name can still be one of these. */
+/** Luau's reserved words. tilua reserves most of them too — `local` is the
+ *  exception, so a tilua name can still be one of these. */
 export const LUAU_KEYWORDS = new Set([
     "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
     "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",

@@ -6,7 +6,7 @@
  * every name the file mentions anywhere is taken up front. A name is only
  * reused by coincidence of a different spelling, never by accident.
  */
-import type * as T from "luaut-parser"
+import type * as T from "@tilua/parser"
 
 export class Names {
     private constructor(private readonly taken: Set<string>) {}

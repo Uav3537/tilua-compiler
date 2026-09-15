@@ -1,5 +1,5 @@
 /**
- * luaut-build tests.
+ * @tilua/compiler tests.
  *
  * Lowering cases compile a fragment and compare the Luau it prints, with the
  * printer's line breaks folded into spaces so a case reads on one line. Every
@@ -15,8 +15,11 @@ import { execFileSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { parse as parseLuau } from "luau-parser"
+import { parse as parseLuau, print as printLuau } from "luau-parser"
+import { parse as parseTilua, analyzeScopes as analyzeScopesTilua, analyzeTypes as analyzeTypesTilua } from "@tilua/parser"
 import { bundle, compile, type BundleResult } from "../src/index.js"
+import { lower } from "../src/lower.js"
+import * as luau from "../src/luau.js"
 
 let passed = 0
 let skipped = 0
@@ -39,6 +42,41 @@ function validLuau(name: string, code: string): void {
     }
 }
 
+/** Every Luau-only thing, as the node it parses to. Parsing the output with
+ *  luau-parser only proves it is valid *Luau* — and Luau is a superset, so a
+ *  `+=` left in by mistake would sail through. Without a Lua 5.1 interpreter to
+ *  hand, walking the tree for what 5.1 has no syntax for is the next best
+ *  thing, and it says exactly which construct survived. */
+const LUAU_ONLY: Record<string, (node: Record<string, unknown>) => boolean> = {
+    CompoundAssignmentStatement: () => true,
+    ContinueStatement: () => true,
+    IfElseExpression: () => true,
+    BinaryExpression: node => node.operator === "//",
+    NumberLiteral: node => typeof node.raw === "string" && (node.raw.includes("_") || /^0[bB]/.test(node.raw)),
+}
+
+function validLua51(name: string, code: string): void {
+    const found = new Set<string>()
+    const walk = (value: unknown): void => {
+        if (!value || typeof value !== "object") return
+        if (Array.isArray(value)) return void value.forEach(walk)
+        const node = value as Record<string, unknown>
+        const rejects = typeof node.type === "string" ? LUAU_ONLY[node.type] : undefined
+        if (rejects?.(node)) found.add(String(node.type) + (node.operator ? ` '${node.operator}'` : ""))
+        for (const [key, child] of Object.entries(node)) {
+            if (key !== "line" && key !== "column") walk(child)
+        }
+    }
+    try {
+        walk(parseLuau(code))
+    } catch {
+        return // validLuau reports the parse failure itself
+    }
+    if (found.size) {
+        failures.push(`${name}\n    Lua 5.1 output still has: ${[...found].join(", ")}\n${code}`)
+    }
+}
+
 /** Compile `source` and check its output, on one line. */
 async function lowers(name: string, source: string, expected: string): Promise<void> {
     const result = await compile(source)
@@ -50,11 +88,77 @@ async function lowers(name: string, source: string, expected: string): Promise<v
     check(name, flat(result.code), expected)
 }
 
+/** Lower `source` for stock Lua 5.1 and check its output, on one line. */
+function lowers51(name: string, source: string, expected: string): void {
+    const program = parseTilua(source)
+    const result = lower(program, analyzeScopesTilua(program), { target: "lua51" })
+    if (result.diagnostics.length) {
+        failures.push(`${name}\n    did not lower: ${result.diagnostics.map(d => d.message).join("; ")}`)
+        return
+    }
+    const code = printLuau(luau.program(result.statements))
+    validLuau(name, code)
+    validLua51(name, code)
+    check(name, flat(code), expected)
+}
+
+/** The Lua 5.1 lowering refuses `source`, saying `reason`. */
+function refuses51(name: string, source: string, reason: string): void {
+    const program = parseTilua(source)
+    const result = lower(program, analyzeScopesTilua(program), { target: "lua51" })
+    check(name, result.diagnostics.map(d => d.message.includes(reason)), [true])
+}
+
 // --- declarations ---------------------------------------------------------------
 await lowers("const and let are local", "const a = 1\nlet b, c = 2, 3", "local a = 1; local b, c = 2, 3;")
 await lowers("a declaration without a value", "let x", "local x;")
 await lowers("types are dropped", "type P = { x: number }\ndeclare game: unknown\nconst n: number = 1 as number", "local n = 1;")
 await lowers("satisfies and as const are dropped", "const t = { a: 1 } satisfies { a: number }\nconst u = [1] as const", "local t = { a = 1 }; local u = { 1 };")
+// --- the Lua 5.1 target -----------------------------------------------------
+// Stock 5.1 has none of Luau's additions, and no `goto` to lower `continue` to.
+{
+    lowers51("lua51: compound assignment expands", "let a = 1\na += 2", "local a = 1; a = a + (2);")
+    lowers51("lua51: concat assignment expands", "let s = \"a\"\ns ..= \"b\"", "local s = \"a\"; s = s .. (\"b\");")
+    // `t[next()] += 1` must not advance twice: object and key are read once.
+    lowers51("lua51: a compound assignment reads its target once",
+        "const t = [1]\nlet i = 1\nt[i] += 2",
+        "local t = { 1 }; local i = 1; do local target = t; local key = i; target[key] = target[key] + (2); end;")
+    lowers51("lua51: floor division becomes math.floor", "const q = 7 // 2", "local q = math.floor(7 / (2));")
+    // `c and a or b` is only right where the branch cannot be false or nil.
+    lowers51("lua51: an if-else expression with literal arms is and/or",
+        "const c = true\nconst v = c ? 1 : 2", "local c = true; local v = (c and 1 or 2);")
+    lowers51("lua51: an if-else expression that could yield false becomes a call",
+        "declare c: boolean\ndeclare a: boolean\ndeclare b: boolean\nconst v = c ? a : b",
+        "local v = (function() if c then return a; else return b; end; end)();")
+    lowers51("lua51: separators and binary literals are rewritten",
+        "const big = 1_000_000\nconst bin = 0b1010", "local big = 1000000; local bin = 10;")
+    // `repeat ... until true` runs once, so breaking out of it is `continue`.
+    lowers51("lua51: continue becomes a break out of a one-pass repeat",
+        "for (i = 1, 3) {\n  if (i == 1) { continue }\n  print(i)\n}",
+        "for i = 1, 3 do repeat if i == 1 then break; end; print(i); until true; end;")
+    // A real `break` would now leave only that repeat, so it raises a flag.
+    lowers51("lua51: a break alongside a continue breaks the loop for real",
+        "for (i = 1, 3) {\n  if (i == 1) { continue }\n  if (i == 2) { break }\n  print(i)\n}",
+        "for i = 1, 3 do local broke = false; repeat if i == 1 then break; end; " +
+        "if i == 2 then broke = true; break; end; print(i); until true; if broke then break; end; end;")
+    lowers51("lua51: a loop with no continue is left alone",
+        "for (i = 1, 3) {\n  if (i == 2) { break }\n  print(i)\n}",
+        "for i = 1, 3 do if i == 2 then break; end; print(i); end;")
+    // A `repeat`'s condition reads the body's locals; the inner repeat would
+    // hide them, so that one combination is refused rather than miscompiled.
+    refuses51("lua51: a repeat whose condition reads a body local is refused",
+        "let n = 0\nrepeat {\n  const step = 1\n  n += step\n  if (n == 1) { continue }\n} until (n >= 3 and step == 1)",
+        "cannot be compiled for Lua 5.1")
+    lowers51("lua51: a repeat whose condition reads nothing from the body is fine",
+        "let n = 0\nrepeat {\n  n += 1\n  if (n == 1) { continue }\n} until (n >= 3)",
+        "local n = 0; repeat repeat n = n + (1); if n == 1 then break; end; until true; until n >= 3;")
+}
+
+// A name on a line of its own is written to ask the editor about it. Lua has
+// no expression statement and it can run nothing, so it leaves no trace.
+await lowers("a bare expression statement is dropped",
+    "const value = 1\nvalue\nvalue + 1\nprint(value)",
+    "local value = 1; print(value);")
 
 // --- object destructuring --------------------------------------------------------
 await lowers("reads straight from a name", "const { a, b } = value", "local a, b = value.a, value.b;")
@@ -90,10 +194,10 @@ await lowers("object literals", `const t = { a: 1, "b-c": 2, [k]: 3, d }`, `loca
 await lowers("array literals are tables", "const xs = [1, 2, 3]", "local xs = { 1, 2, 3 };")
 await lowers("object spread copies in order",
     "const t = { a: 1, ...base, b: 2 }",
-    `local function luaut_assign(target, ...) for i = 1, select("#", ...) do local source = select(i, ...); if source ~= nil then for key, value in pairs(source) do target[key] = value; end; end; end; return target; end; local t = luaut_assign({}, { a = 1 }, base, { b = 2 });`)
+    `local function tilua_assign(target, ...) for i = 1, select("#", ...) do local source = select(i, ...); if source ~= nil then for key, value in pairs(source) do target[key] = value; end; end; end; return target; end; local t = tilua_assign({}, { a = 1 }, base, { b = 2 });`)
 await lowers("array spread joins the runs",
     "const xs = [f(), ...ys, g()]",
-    `local function luaut_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = luaut_concat({ (f()) }, ys, { (g()) });`)
+    `local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { (g()) });`)
 await lowers("interpolation becomes format", "print(`${a} any`)", `print(("%s any"):format(tostring(a)));`)
 await lowers("interpolation escapes percent signs and keeps braces",
     "print(`${n}% of {total}`)", `print(("%s%% of {total}"):format(tostring(n)));`)
@@ -120,7 +224,7 @@ await lowers("an iterator function keeps its own values", "for (k in pairs(t)) {
 await lowers("attributes are kept", "@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
 await lowers("a shadowed global the output needs is captured first",
     "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
-    `local luaut_table = table; local table = {}; local a = list[1]; local rest = luaut_table.move(list, 2, #list, 1, {}); print(("%s"):format(tostring(a)));`)
+    `local tilua_table = table; local table = {}; local a = list[1]; local rest = tilua_table.move(list, 2, #list, 1, {}); print(("%s"):format(tostring(a)));`)
 
 check("a parse error leaves no output",
     ((r: { code?: string; diagnostics: unknown[] }) => [r.code, r.diagnostics.length > 0])(await compile("const = 1")), [undefined, true])
@@ -128,14 +232,14 @@ check("reassigning a const is an error",
     (await compile("const a = 1\na = 2")).diagnostics.map(d => d.message), ["Cannot assign to 'a' — it is a const"])
 await lowers("import type is erased", `import type { Shape } from "./m"\nconst s: Shape = { r: 1 }`, "local s = { r = 1 };")
 check("modules need a bundle",
-    (await compile(`import { a } from "./m"`)).diagnostics.map(d => d.message), ["Imports and exports need a bundle: build the project with luaut-build"])
+    (await compile(`import { a } from "./m"`)).diagnostics.map(d => d.message), ["Imports and exports need a bundle: build the project with @tilua/compiler"])
 
 // --- bundles ---------------------------------------------------------------------
 
 const luauBinary = findLuau()
 
 function project(files: Record<string, string>): string {
-    const root = mkdtempSync(join(tmpdir(), "luaut-build-"))
+    const root = mkdtempSync(join(tmpdir(), "tilua-compiler-"))
     for (const [path, text] of Object.entries(files)) {
         mkdirSync(dirname(join(root, path)), { recursive: true })
         writeFileSync(join(root, path), text)
@@ -154,7 +258,7 @@ function run(name: string, result: BundleResult): string[] | undefined {
         skipped++
         return undefined
     }
-    const file = join(mkdtempSync(join(tmpdir(), "luaut-run-")), "bundle.luau")
+    const file = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
     writeFileSync(file, result.code)
     try {
         return execFileSync(luauBinary, [file], { encoding: "utf8" }).trim().split(/\r?\n/)
@@ -169,6 +273,77 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
     if (output) check(name, output, expected)
 }
 
+// `console:log` shows a function as the type it was inferred to have and the
+// code it was written as. Neither exists at runtime, so the compiler is the
+// only thing that can say them, and it passes both alongside the value.
+{
+    const analyze = (code: string) => {
+        const program = parseTilua(code)
+        const scopes = analyzeScopesTilua(program)
+        const result = lower(program, scopes, {
+            source: code,
+            types: analyzeTypesTilua(program, scopes, { diagnostics: false }),
+        })
+        return flat(printLuau(luau.program(result.statements)))
+    }
+
+    // Nothing worth saying about a string or a table: no meta at all.
+    check("console: a call with nothing to describe passes no meta",
+        analyze(`console:log("hi", 42)`).includes(`.log(nil, "hi", 42)`), true)
+
+    // A function is followed back to what it was declared as.
+    const named = analyze("const double = (x: number) => x * 2\nconsole:log(double)")
+    check("console: a function is described by its type and its code", [
+        named.includes(`"(x: number) => number"`),
+        named.includes(`"(x: number) => x * 2"`),
+    ], [true, true])
+
+    // A local `console` is the author's own, and is left alone.
+    check("console: a local named console is not the language's",
+        analyze("const console = { log: (self: unknown, n: number) => {} }\nconsole:log(1)").includes("console:log(1)"), true)
+
+    check("console: warn and error go through the same runtime", [
+        analyze(`console:warn("careful")`).includes(".warn(nil,"),
+        analyze(`console:error("boom")`).includes(".error(nil,"),
+    ], [true, true])
+}
+
+// A bundle is one file, so a line in it says nothing about which of the
+// project's files wrote it. The map is what `console:error` reads to answer
+// that, and it is only worth having if every entry is right.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [], paths: {}, sourceMap: null }),
+        "src/util.tilua": [
+            "export function twice(n: number): number {",
+            "    const doubled = n * 2",
+            "    return doubled",
+            "}",
+        ].join("\n"),
+        "src/main.tilua": [
+            `import { twice } from "./util"`,
+            "const start = 2",
+            "print(twice(start))",
+        ].join("\n"),
+    })
+    const result = await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false })
+    const code = result.code ?? ""
+    const lines = code.split("\n")
+    const map = new Map<number, string>()
+    for (const m of code.slice(code.indexOf(".lines = ")).matchAll(/\[(\d+)\]\s*=\s*\{\s*"([^"]+)"\s*,\s*(\d+)\s*\}/g)) {
+        map.set(Number(m[1]), `${m[2]}:${m[3]}`)
+    }
+    // Every mapped line, as `what the bundle says` -> `where it was written`.
+    const resolved = [...map].sort((a, b) => a[0] - b[0])
+        .map(([line, origin]) => `${(lines[line - 1] ?? "").trim()} -> ${origin}`)
+    check("line map: each bundled line points back at the source that wrote it", resolved, [
+        "print(util.twice(start)); -> src/main.tilua:3",
+        "function exports.twice(n) -> src/util.tilua:1",
+        "local doubled = n * 2; -> src/util.tilua:2",
+        "return doubled; -> src/util.tilua:3",
+    ])
+}
+
 /** Run a bundle that should fail, and check its error mentions `message`. */
 function fails(name: string, result: BundleResult, message: string): void {
     if (result.code === undefined) {
@@ -180,7 +355,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         skipped++
         return
     }
-    const file = join(mkdtempSync(join(tmpdir(), "luaut-run-")), "bundle.luau")
+    const file = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
     writeFileSync(file, result.code)
     try {
         execFileSync(luauBinary, [file], { encoding: "utf8", stdio: "pipe" })
@@ -194,22 +369,22 @@ function fails(name: string, result: BundleResult, message: string): void {
 
 {
     const root = project({
-        "luaut.config.json": JSON.stringify({ types: [], paths: { "@/*": ["src/*"] }, sourceMap: null }),
-        "src/main.luaut": `import { twice } from "./math"\nimport { NAME } from "@/names"\nprint(twice(21), NAME)\n`,
-        "src/math.luaut": "export function twice(n: number): number {\n    return n * 2\n}\n",
-        "src/names.luaut": `export const NAME = "luaut"\n`,
+        "tilua.config.json": JSON.stringify({ types: [], paths: { "@/*": ["src/*"] }, sourceMap: null }),
+        "src/main.tilua": `import { twice } from "./math"\nimport { NAME } from "@/names"\nprint(twice(21), NAME)\n`,
+        "src/math.tilua": "export function twice(n: number): number {\n    return n * 2\n}\n",
+        "src/names.tilua": `export const NAME = "tilua"\n`,
     })
-    const result = await bundle({ entry: join(root, "src/main.luaut") })
+    const result = await bundle({ entry: join(root, "src/main.tilua") })
     check("bundle: every module the entry reaches, named from the config's folder",
         result.modules, ["src/main", "src/math", "src/names"])
-    runs("bundle: imports through relative paths and aliases", result, ["42\tluaut"])
+    runs("bundle: imports through relative paths and aliases", result, ["42\ttilua"])
 }
 
 {
     // a imports b, which imports a back while a is still loading.
     const root = project({
-        "main.luaut": `import { a1, counter, bump } from "./a"\nprint("main", a1())\nbump()\nbump()\nprint("counter", counter)\n`,
-        "a.luaut": [
+        "main.tilua": `import { a1, counter, bump } from "./a"\nprint("main", a1())\nbump()\nbump()\nprint("counter", counter)\n`,
+        "a.tilua": [
         "import { readLate } from \"./b\"",
         "export let counter = 0",
         "export function a1(): string { return \"a1\" }",
@@ -220,7 +395,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         "",
         "",
     ].join("\n"),
-        "b.luaut": [
+        "b.tilua": [
         "import { hoisted, late } from \"./a\"",
         "print(\"b during the cycle\", hoisted())",
         "export function readLate(): string { return late }",
@@ -229,48 +404,48 @@ function fails(name: string, result: BundleResult, message: string): void {
     ].join("\n"),
     })
     runs("bundle: a cycle sees hoisted functions at once, and later values live",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }),
         ["b during the cycle\thoisted", "a sees\tlate", "main\ta1", "counter\t2"])
 }
 
 {
     // Reading what the other module has not initialized yet is an error, as in ES modules.
     const root = project({
-        "main.luaut": `import { value } from "./a"\nprint(value)\n`,
-        "a.luaut": `import { early } from "./b"\nexport const value = early\n`,
-        "b.luaut": `import { value } from "./a"\nexport const early = value\n`,
+        "main.tilua": `import { value } from "./a"\nprint(value)\n`,
+        "a.tilua": `import { early } from "./b"\nexport const value = early\n`,
+        "b.tilua": `import { value } from "./a"\nexport const early = value\n`,
     })
     fails("bundle: a value read across a cycle before it is initialized is an error",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }),
         "Cannot access 'value' before initialization: 'a' has not reached it yet")
 }
 
 {
     // Re-exports are references: a later change shows through them.
     const root = project({
-        "main.luaut": `import { count, bump } from "./re"\nimport * as All from "./all"\nprint(count, All.count)\nbump()\nprint(count, All.count)\n`,
-        "state.luaut": `export let count = 0\nexport function bump() { count += 1 }\n`,
-        "re.luaut": `export { count, bump } from "./state"\n`,
-        "all.luaut": `export * from "./state"\n`,
+        "main.tilua": `import { count, bump } from "./re"\nimport * as All from "./all"\nprint(count, All.count)\nbump()\nprint(count, All.count)\n`,
+        "state.tilua": `export let count = 0\nexport function bump() { count += 1 }\n`,
+        "re.tilua": `export { count, bump } from "./state"\n`,
+        "all.tilua": `export * from "./state"\n`,
     })
     runs("bundle: re-exports and export * stay live",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["0\t0", "1\t1"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["0\t0", "1\t1"])
 }
 
 {
     const root = project({
-        "main.luaut": `import * as Util from "./util"\nprint(Util.twice(4), Util.NAME, Util.default)\n`,
-        "util.luaut": `export function twice(n: number): number { return n * 2 }\nexport const NAME = "util"\nexport default true\n`,
+        "main.tilua": `import * as Util from "./util"\nprint(Util.twice(4), Util.NAME, Util.default)\n`,
+        "util.tilua": `export function twice(n: number): number { return n * 2 }\nexport const NAME = "util"\nexport default true\n`,
     })
-    runs("bundle: import * as", await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["8\tutil\ttrue"])
+    runs("bundle: import * as", await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["8\tutil\ttrue"])
 }
 
 {
     const root = project({
-        "main.luaut": `import { value } from "./m"\nvalue = 2\n`,
-        "m.luaut": `export let value = 1\n`,
+        "main.tilua": `import { value } from "./m"\nvalue = 2\n`,
+        "m.tilua": `export let value = 1\n`,
     })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: assigning to an import is an error, and leaves no bundle",
         [result.code, result.diagnostics.map(d => [d.category, d.message])],
         [undefined, [["scope", "Cannot assign to 'value' — it is an import"]]])
@@ -278,30 +453,30 @@ function fails(name: string, result: BundleResult, message: string): void {
 
 {
     const root = project({
-        "main.luaut": `import { later, set } from "./m"\nprint(later)\nset()\nprint(later)\n`,
-        "m.luaut": `export let later\nexport function set() { later = "set" }\n`,
+        "main.tilua": `import { later, set } from "./m"\nprint(later)\nset()\nprint(later)\n`,
+        "m.tilua": `export let later\nexport function set() { later = "set" }\n`,
     })
     runs("bundle: `export let` without a value is initialized to nil",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["nil", "set"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["nil", "set"])
 }
 
 {
     const root = project({
-        "main.luaut": `import def, { x as y } from "./m"\nimport { all } from "./re"\nprint(def.v, y, all)\n`,
-        "m.luaut": `export const x = "x"\nexport default { v: "default" }\n`,
-        "re.luaut": `export * from "./m"\nexport { x as all } from "./m"\n`,
+        "main.tilua": `import def, { x as y } from "./m"\nimport { all } from "./re"\nprint(def.v, y, all)\n`,
+        "m.tilua": `export const x = "x"\nexport default { v: "default" }\n`,
+        "re.tilua": `export * from "./m"\nexport { x as all } from "./m"\n`,
     })
     runs("bundle: default, renamed and re-exported names",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["default\tx\tx"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["default\tx\tx"])
 }
 
 {
     const root = project({
-        "main.luaut": `import { Shape } from "./types"\nimport { value } from "./values"\nconst s: Shape = { r: value }\nprint(s.r)\n`,
-        "types.luaut": "export type Shape = { r: number }\n",
-        "values.luaut": "export const value = 3\n",
+        "main.tilua": `import { Shape } from "./types"\nimport { value } from "./values"\nconst s: Shape = { r: value }\nprint(s.r)\n`,
+        "types.tilua": "export type Shape = { r: number }\n",
+        "values.tilua": "export const value = 3\n",
     })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: a module imported only for types is left out", result.modules, ["main", "values"])
     runs("bundle: and the rest still runs", result, ["3"])
 }
@@ -310,42 +485,42 @@ function fails(name: string, result: BundleResult, message: string): void {
     // `import type` is erased whatever it names: even a module whose code
     // would run is never required for it.
     const root = project({
-        "main.luaut": `import type { Shape, noisy } from "./noisy"\nimport type * as N from "./noisy"\nconst s: Shape = { r: 1 }\nconst f: typeof noisy = function() {}\nconst n: N.Shape = s\nprint(s.r, n.r)\n`,
-        "noisy.luaut": `print("noisy ran")\nexport type Shape = { r: number }\nexport function noisy() {}\n`,
+        "main.tilua": `import type { Shape, noisy } from "./noisy"\nimport type * as N from "./noisy"\nconst s: Shape = { r: 1 }\nconst f: typeof noisy = function() {}\nconst n: N.Shape = s\nprint(s.r, n.r)\n`,
+        "noisy.tilua": `print("noisy ran")\nexport type Shape = { r: number }\nexport function noisy() {}\n`,
     })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: a module reached only through import type is left out", result.modules, ["main"])
     runs("bundle: and never runs", result, ["1\t1"])
 }
 
 {
     const root = project({
-        "main.luaut": `import type { value } from "./m"\nprint(value)\n`,
-        "m.luaut": `export const value = 1\n`,
+        "main.tilua": `import type { value } from "./m"\nprint(value)\n`,
+        "m.tilua": `export const value = 1\n`,
     })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: a type-only import used as a value is an error, and leaves no bundle",
         [result.code, result.diagnostics.map(d => [d.category, d.message])],
         [undefined, [["scope", "'value' is imported with 'import type' and can only be used as a type"]]])
 }
 
 {
-    const root = project({ "main.luaut": `export const answer = 42\n` })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const root = project({ "main.tilua": `export const answer = 42\n` })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: an entry that exports returns its exports", flat(result.code ?? "").endsWith(`return G.require("main");`), true)
 }
 
 {
-    const root = project({ "main.luaut": `import { nope } from "./missing"\nprint(nope)\n` })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const root = project({ "main.tilua": `import { nope } from "./missing"\nprint(nope)\n` })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: a module that cannot be found leaves no bundle",
         [result.code, result.diagnostics.map(d => [d.category, d.message])],
         [undefined, [["module", "Cannot find module './missing'"]]])
 }
 
 {
-    const root = project({ "main.luaut": `const n: number = "text"\nprint(n)\n` })
-    const result = await bundle({ entry: join(root, "main.luaut"), config: { types: ["./defs.d.luaut"] } })
+    const root = project({ "main.tilua": `const n: number = "text"\nprint(n)\n` })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: ["./defs.d.tilua"] } })
     check("bundle: type errors are reported and the bundle is still written",
         [result.code !== undefined, result.diagnostics.filter(d => d.category === "type").map(d => d.message)],
         [true, [`Type '"text"' is not assignable to 'number'`]])
@@ -354,7 +529,7 @@ function fails(name: string, result: BundleResult, message: string): void {
 {
     // Most of the language in one program, checked by what it prints.
     const root = project({
-        "main.luaut": [
+        "main.tilua": [
             `import { Stack } from "./stack"`,
             `type Point = { x: number, y: number }`,
             `const table = { note: "shadows the global" }`,
@@ -376,7 +551,7 @@ function fails(name: string, result: BundleResult, message: string): void {
             `{ a, b } = { a: b, b: a }`,
             `print(\`\${x} \${py} \${count} \${first} \${third} \${#tail} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...)`,
         ].join("\n"),
-        "stack.luaut": [
+        "stack.tilua": [
         "export const Stack = {}",
         "Stack.__index = Stack",
         "function Stack.new() {",
@@ -393,19 +568,19 @@ function fails(name: string, result: BundleResult, message: string): void {
     ].join("\n"),
     })
     runs("bundle: the language at runtime",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }),
         ["1 2 2 one three 2 18 big 1 21 100%\tshadows the global"])
 }
 
 {
-    const root = project({ "main.luaut": `const G = 1\nprint(G)\n` })
+    const root = project({ "main.tilua": `const G = 1\nprint(G)\n` })
     runs("bundle: the module table avoids the modules' names",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["1"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["1"])
 }
 
 {
     const root = project({
-        "main.luaut": [
+        "main.tilua": [
         "type Node = { name: string, child: Node | nil, greet: (self: Node, suffix: string) => string, pair: () => (number, number) }",
         "let reads = 0",
         "let argued = 0",
@@ -441,7 +616,7 @@ function fails(name: string, result: BundleResult, message: string): void {
     ].join("\n"),
     })
     runs("bundle: optional chains",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }),
         [
             "root\tnil\tleaf\tnil",
             "root!\tnil\t1",
@@ -451,7 +626,7 @@ function fails(name: string, result: BundleResult, message: string): void {
             "3\t3",
             "leaf\tnil",
         ])
-    const code = (await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })).code ?? ""
+    const code = (await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })).code ?? ""
     check("bundle: an optional read on a name is an `if` expression",
         code.includes("if root == nil then nil else root.name"), true)
 }
@@ -479,8 +654,8 @@ function fails(name: string, result: BundleResult, message: string): void {
         "}",
     ].join("\n")
     const manifest = (extra: Record<string, unknown> = {}): string => JSON.stringify({
-        name: "@luaut/own",
-        luaut: { types: "index.d.luaut", lowering: "lowering.mjs", ...extra },
+        name: "@tilua-types/own",
+        tilua: { types: "index.d.tilua", lowering: "lowering.mjs", ...extra },
     })
     const definitions = [
         "declare function print(...: unknown): ()",
@@ -489,45 +664,45 @@ function fails(name: string, result: BundleResult, message: string): void {
     ].join("\n")
 
     const root = project({
-        "node_modules/@luaut/own/package.json": manifest(),
-        "node_modules/@luaut/own/index.d.luaut": definitions,
-        "node_modules/@luaut/own/lowering.mjs": lowering,
-        "main.luaut": `print(([3, 4]):first(), ("hi"):shout())`,
+        "node_modules/@tilua-types/own/package.json": manifest(),
+        "node_modules/@tilua-types/own/index.d.tilua": definitions,
+        "node_modules/@tilua-types/own/lowering.mjs": lowering,
+        "main.tilua": `print(([3, 4]):first(), ("hi"):shout())`,
     })
     runs("bundle: a type library's own lowering",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: ["own"] } }), ["3\tHI!"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: ["own"] } }), ["3\tHI!"])
 
-    const claimed = (await bundle({ entry: join(root, "main.luaut"), config: { types: ["own"] } })).code ?? ""
+    const claimed = (await bundle({ entry: join(root, "main.tilua"), config: { types: ["own"] } })).code ?? ""
 
     // Declared in the types but not lowered: left as a method call, for the
     // value itself to answer.
     const unclaimed = project({
-        "node_modules/@luaut/own/package.json": manifest(),
-        "node_modules/@luaut/own/index.d.luaut": definitions,
-        "node_modules/@luaut/own/lowering.mjs": lowering,
-        "main.luaut": "const v = ([1]):nope()\n",
+        "node_modules/@tilua-types/own/package.json": manifest(),
+        "node_modules/@tilua-types/own/index.d.tilua": definitions,
+        "node_modules/@tilua-types/own/lowering.mjs": lowering,
+        "main.tilua": "const v = ([1]):nope()\n",
     })
-    const left = (await bundle({ entry: join(unclaimed, "main.luaut"), config: { types: ["own"] } })).code ?? ""
+    const left = (await bundle({ entry: join(unclaimed, "main.tilua"), config: { types: ["own"] } })).code ?? ""
 
     // And with no library at all, nothing is lowered.
-    const bare = project({ "main.luaut": "const v = ([1]):first()\n" })
-    const plain = (await bundle({ entry: join(bare, "main.luaut"), config: { types: [] } })).code ?? ""
+    const bare = project({ "main.tilua": "const v = ([1]):first()\n" })
+    const plain = (await bundle({ entry: join(bare, "main.tilua"), config: { types: [] } })).code ?? ""
 
     check("bundle: the library's runtime is emitted once, and only what it claims", [
-        claimed.includes("function luaut_own.first"),
-        (claimed.match(/local luaut_own = /g) ?? []).length,
+        claimed.includes("function tilua_own.first"),
+        (claimed.match(/local tilua_own = /g) ?? []).length,
         left.includes(":nope()"),
         plain.includes(":first()"),
     ], [true, 1, true, true])
 
     // A module that will not load is reported, and the build goes on.
     const broken = project({
-        "node_modules/@luaut/own/package.json": manifest(),
-        "node_modules/@luaut/own/index.d.luaut": definitions,
-        "node_modules/@luaut/own/lowering.mjs": "export default",
-        "main.luaut": "const v = ([1]):first()\n",
+        "node_modules/@tilua-types/own/package.json": manifest(),
+        "node_modules/@tilua-types/own/index.d.tilua": definitions,
+        "node_modules/@tilua-types/own/lowering.mjs": "export default",
+        "main.tilua": "const v = ([1]):first()\n",
     })
-    const result = await bundle({ entry: join(broken, "main.luaut"), config: { types: ["own"] } })
+    const result = await bundle({ entry: join(broken, "main.tilua"), config: { types: ["own"] } })
     check("bundle: a lowering module that will not load is a problem, not a crash", [
         result.diagnostics.some(d => d.message.includes("failed to load")),
         (result.code ?? "").includes(":first()"),
@@ -536,7 +711,7 @@ function fails(name: string, result: BundleResult, message: string): void {
 
 {
     const root = project({
-        "main.luaut": [
+        "main.tilua": [
         "let argued = 0",
         "function arg(): string {",
         "    argued += 1",
@@ -559,34 +734,34 @@ function fails(name: string, result: BundleResult, message: string): void {
     ].join("\n"),
     })
     runs("bundle: optional calls",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }),
         ["got!\tnil\t1", "2", "A", "nil"])
 }
 
 {
     const root = project({
-        "main.luaut": [
+        "main.tilua": [
             `const a = 1`,
-            `--@luaut-ignore`,
+            `--@tilua-ignore`,
             `a = 2`,
-            `const n: number = "x" --@luaut-expect-error covers the next line of code, not its own`,
-            `--@luaut-expect-error`,
+            `const n: number = "x" --@tilua-expect-error covers the next line of code, not its own`,
+            `--@tilua-expect-error`,
             `print(a)`,
         ].join("\n"),
-        "quiet.luaut": `--@luaut-nocheck\nconst b = 1\nb = 2\nconst s: number = "x"\n`,
+        "quiet.tilua": `--@tilua-nocheck\nconst b = 1\nb = 2\nconst s: number = "x"\n`,
     })
-    const loud = await bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    const loud = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
     check("bundle: directives suppress scope and type errors, and an unused expect-error is one",
         loud.diagnostics.map(d => `${d.line}: ${d.message}`),
-        ["4: Type '\"x\"' is not assignable to 'number'", "4: Unused '@luaut-expect-error' directive", "5: Unused '@luaut-expect-error' directive"])
+        ["4: Type '\"x\"' is not assignable to 'number'", "4: Unused '@tilua-expect-error' directive", "5: Unused '@tilua-expect-error' directive"])
     const unknown = project({
-        "main.luaut": `counter = 1\nprint(counter)\nprint(typo)\n`,
-        "defs.d.luaut": `declare function print(...: unknown): ()\n`,
+        "main.tilua": `counter = 1\nprint(counter)\nprint(typo)\n`,
+        "defs.d.tilua": `declare function print(...: unknown): ()\n`,
     })
-    const withUnknown = await bundle({ entry: join(unknown, "main.luaut"), config: { types: ["./defs.d.luaut"] } })
+    const withUnknown = await bundle({ entry: join(unknown, "main.tilua"), config: { types: ["./defs.d.tilua"] } })
     check("bundle: a name nothing declares is reported, and still builds",
         [withUnknown.diagnostics.map(d => d.message), withUnknown.code !== undefined], [["Cannot find name 'typo'"], true])
-    const quiet = await bundle({ entry: join(root, "quiet.luaut"), config: { types: [] } })
+    const quiet = await bundle({ entry: join(root, "quiet.tilua"), config: { types: [] } })
     check("bundle: nocheck builds a file with scope errors", [quiet.diagnostics, quiet.code !== undefined], [[], true])
 }
 
@@ -614,9 +789,9 @@ function fails(name: string, result: BundleResult, message: string): void {
         "",
         "",
     ].join("\n")
-    const root = project({ "main.luaut": source })
+    const root = project({ "main.tilua": source })
     runs("bundle: functions are hoisted, and see the module's later names",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["even\t3\teven\todd"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["even\t3\teven\todd"])
     // Outside a bundle: the same, as one file.
     const single = await compile(source)
     check("compile: a function used above its declaration is hoisted whole", single.diagnostics.map(d => d.message), [])
@@ -625,7 +800,7 @@ function fails(name: string, result: BundleResult, message: string): void {
 
 {
     const root = project({
-        "tags.luaut": [
+        "tags.tilua": [
             "export function Tags(a: number, b: number): boolean",
             "export function Tags(a?: number, b?: number): string",
             "export function Tags(a: number = 1, b?: number): string {",
@@ -634,11 +809,11 @@ function fails(name: string, result: BundleResult, message: string): void {
             "",
             "",
         ].join("\n"),
-        "main.luaut": `import { Tags } from "./tags"\nprint(Tags(1, 2))\n`,
-        "defs.d.luaut": "declare function print(...: unknown): ()\ndeclare function tostring(value: unknown): string\n",
+        "main.tilua": `import { Tags } from "./tags"\nprint(Tags(1, 2))\n`,
+        "defs.d.tilua": "declare function print(...: unknown): ()\ndeclare function tostring(value: unknown): string\n",
     })
     runs("bundle: an exported overload set is one function",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: ["./defs.d.luaut"] } }), ["12"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: ["./defs.d.tilua"] } }), ["12"])
 }
 
 {
@@ -665,9 +840,9 @@ function fails(name: string, result: BundleResult, message: string): void {
         "",
         "",
     ].join("\n")
-    const root = project({ "main.luaut": source })
+    const root = project({ "main.tilua": source })
     runs("bundle: a closure reads the name its own value is bound to",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["2\t7\t2"])
+        await bundle({ entry: join(root, "main.tilua"), config: { types: [] } }), ["2\t7\t2"])
     const single = await compile(source)
     if (single.code !== undefined) {
         runs("compile: the same outside a bundle",
@@ -677,7 +852,7 @@ function fails(name: string, result: BundleResult, message: string): void {
 
 function findLuau(): string | undefined {
     const candidates = [process.env.LUAU, "luau"].filter((c): c is string => !!c)
-    const empty = join(mkdtempSync(join(tmpdir(), "luaut-probe-")), "empty.luau")
+    const empty = join(mkdtempSync(join(tmpdir(), "tilua-probe-")), "empty.luau")
     writeFileSync(empty, "")
     for (const candidate of candidates) {
         try {
@@ -698,10 +873,10 @@ await lowers("a spread argument last is Lua's own expansion",
     "f(1, table.unpack(xs));")
 await lowers("a spread anywhere else builds the list first",
     "declare xs: number[]\nf(...xs, 1)",
-    "local function luaut_concat(...) local result = {}; "
+    "local function tilua_concat(...) local result = {}; "
     + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
     + "return result; end; "
-    + "f(table.unpack(luaut_concat(xs, { 1 })));")
+    + "f(table.unpack(tilua_concat(xs, { 1 })));")
 await lowers("a `return` spreads the same way a call does",
     "declare xs: number[]\nfunction f() {\n    return ...xs\n}",
     "local function f() return table.unpack(xs); end;")
@@ -742,8 +917,8 @@ await lowers("an array of the varargs is Lua's own table of them",
 // sure is to run it.
 {
     const root = project({
-        "luaut.config.json": JSON.stringify({ types: [], sourceMap: null }),
-        "shape.luaut": [
+        "tilua.config.json": JSON.stringify({ types: [], sourceMap: null }),
+        "shape.tilua": [
             "export class Shape {",
             "    name: string",
             "    sides = 0",
@@ -772,7 +947,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "",
             "",
         ].join("\n"),
-        "main.luaut": [
+        "main.tilua": [
             "import { Shape } from \"./shape\"",
             "",
             "class Square extends Shape {",
@@ -812,7 +987,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "",
         ].join("\n"),
     })
-    const result = await bundle({ entry: join(root, "main.luaut") })
+    const result = await bundle({ entry: join(root, "main.tilua") })
     check("class: the bundle type-checks", result.diagnostics.map(d => d.message), [])
     runs("class: instances, inheritance, super, accessors and statics", result, [
         "square has area 9 (square)",
@@ -829,8 +1004,8 @@ await lowers("an array of the varargs is Lua's own table of them",
 // instance. Only running it can show that.
 {
     const root = project({
-        "luaut.config.json": JSON.stringify({ types: [], sourceMap: null }),
-        "box.luaut": [
+        "tilua.config.json": JSON.stringify({ types: [], sourceMap: null }),
+        "box.tilua": [
             "export default class Box<T> {",
             "    value: T",
             "    constructor(value: T) {",
@@ -847,7 +1022,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "",
             "",
         ].join("\n"),
-        "main.luaut": [
+        "main.tilua": [
             "import Box from \"./box\"",
             "",
             "class Base {",
@@ -893,7 +1068,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "",
         ].join("\n"),
     })
-    const result = await bundle({ entry: join(root, "main.luaut") })
+    const result = await bundle({ entry: join(root, "main.tilua") })
     check("class: the bundle with generics, a class value and a default export type-checks",
         result.diagnostics.map(d => d.message), [])
     runs("class: an instance points at its class, and a class at the one it extends", result, [
@@ -922,21 +1097,21 @@ await lowers("class: the simple case is the plain Lua idiom",
         "",
         "",
     ].join("\n"),
-    "local function luaut_class(base) local class = { __getters = {}, __setters = {} }; class.__index = class; "
+    "local function tilua_class(base) local class = { __getters = {}, __setters = {} }; class.__index = class; "
     + "class.ClassObject = class; class.ParentClass = base; "
     + "if base ~= nil then setmetatable(class, { __index = base }); setmetatable(class.__getters, { __index = base.__getters }); "
     + "setmetatable(class.__setters, { __index = base.__setters }); end; return class; end; "
-    + "local function luaut_accessors(class) "
+    + "local function tilua_accessors(class) "
     + "if not class.__dynamic and next(class.__getters) == nil and next(class.__setters) == nil then return; end; "
     + "class.__dynamic = true; "
     + "class.__index = function(this, key) local getter = class.__getters[key]; if getter ~= nil then return getter(this); end; return class[key]; end; "
     + "class.__newindex = function(this, key, value) local setter = class.__setters[key]; if setter ~= nil then setter(this, value); return; end; rawset(this, key, value); end; "
     + "end; "
-    + "local Counter = luaut_class(nil); "
+    + "local Counter = tilua_class(nil); "
     + "function Counter.bump(this) this.n += 1; return this.n; end; "
     + "function Counter.__init(this, ...) this.n = 0; end; "
     + "function Counter.new(...) local this = setmetatable({}, Counter); Counter.__init(this, ...); return this; end; "
-    + "luaut_accessors(Counter);")
+    + "tilua_accessors(Counter);")
 
 // `new` is the class's own `new`, and nothing more.
 await lowers("class: new is a call of the class's own constructor",

@@ -1,12 +1,12 @@
 {
-  "name": "luaut-build",
-  "version": "2.1.0",
-  "description": "Compiles luaut to Luau: lowers the luaut-parser AST to a luau-parser AST and prints it",
+  "name": "@tilua/compiler",
+  "version": "1.0.0",
+  "description": "Compiles tilua to Luau: lowers the @tilua/parser AST to a luau-parser AST and prints it",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "luaut-build": "dist/cli.js"
+    "tilua": "dist/cli.js"
   },
   "files": [
     "dist"
@@ -27,7 +27,7 @@
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
-    "luaut",
+    "tilua",
     "luau",
     "roblox",
     "compiler"
@@ -37,7 +37,7 @@
   "type": "module",
   "dependencies": {
     "luau-parser": "^1.0.3",
-    "luaut-parser": "^5.2.0"
+    "@tilua/parser": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",
@@ -47,6 +47,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Uav3537/luaut-build.git"
+    "url": "git+https://github.com/Uav3537/tilua-compiler.git"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
