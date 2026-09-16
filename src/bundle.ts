@@ -157,16 +157,19 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         const file = pending.shift()!
         if (modules.has(file)) continue
         const source = sources.get(file)!
+        const shown = relative(root, file).replace(/\\/g, "/")
         const lowered = lower(source.program, source.scopes, {
             names,
             types: analysis.types.get(file),
             lowerings,
             target: options.target ?? config?.target,
             source: source.text,
+            file: shown,
             module: {
                 name: source.name,
                 require: requireExpression,
                 lines: `${G}.lines`,
+                fail: `${G}.fail`,
                 resolve: specifier => {
                     const target = resolveModulePath(file, specifier, config)
                     if (!target || target.endsWith(".d.tilua") || !sources.has(target)) return undefined
@@ -176,7 +179,6 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
             },
         })
         for (const d of lowered.diagnostics) diagnostics.push({ file, ...d, category: "module" })
-        const shown = relative(root, file).replace(/\\/g, "/")
         for (const statement of allStatements(lowered.statements)) {
             const line = lowered.origins.get(statement)
             if (line !== undefined) origins.set(statement, { file: shown, line })
@@ -237,15 +239,28 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         fields.push(luau.field("load", luau.functionExpression(luau.functionBody([module.exportsName], module.statements, true))))
         modulesTable.fields.push({ type: "TableFieldComputed", key: luau.string(module.name), value: luau.table(fields) })
     }
-    const start = luau.call(requireExpression, [luau.string(sources.get(entry)!.name)])
-    program.body.statements.push(modules.get(entry)!.info.exports ? luau.returns([start]) : luau.callStatement(start))
+    // The entry runs under `xpcall`, so an error nothing caught — `nil.x`, an
+    // `error` of the author's — is reported in the project's files rather than
+    // as a line of this bundle, and only then raised.
+    const ok = names.fresh("ok")
+    const result = names.fresh("result")
+    const entryStatements = parseLuau(`
+local ${ok}, ${result} = xpcall(function()
+    return ${G}.require(${JSON.stringify(sources.get(entry)!.name)})
+end, ${G}.fail)
+if not ${ok} then
+    error(${result}, 0)
+end
+${modules.get(entry)!.info.exports ? `return ${result}` : ""}
+`).body.statements
+    program.body.statements.push(...entryStatements)
 
     // The map is read off the printed text, so it can only be built once that
     // text exists. Its own assignment then goes in immediately before the entry
-    // call — after every module body, so nothing the map describes moves.
+    // runs — after every module body, so nothing the map describes moves.
     const map = buildLineMap(program, parseLuau(print(program)), origins)
     if (map.size) {
-        program.body.statements.splice(program.body.statements.length - 1, 0, luau.assign(
+        program.body.statements.splice(program.body.statements.length - entryStatements.length, 0, luau.assign(
             [luau.member(luau.identifier(G), "lines")],
             [parseExpressionFromSource(lineMapSource(map))],
         ))
@@ -260,6 +275,52 @@ function runtime(G: string): string {
 local ${G}
 ${G} = {
     modules = {},
+    -- Filled in just before the entry runs: bundle line -> { file, line }.
+    lines = nil,
+    -- What an error nothing caught says, in the project's files: the bundle's
+    -- own positions in the message are replaced by the places they came from,
+    -- and a traceback of those places follows. A message that is not a string
+    -- is left as it is, and a position that is not this bundle's (a library
+    -- that raised its error with one already mapped) is left alone.
+    fail = function(message)
+        if type(message) ~= "string" then
+            return message
+        end
+        local lines = ${G}.lines
+        if lines == nil then
+            return debug.traceback(message, 2)
+        end
+        local chunk
+        if debug.info ~= nil then
+            chunk = debug.info(1, "s")
+        else
+            chunk = debug.getinfo(1, "S").short_src
+        end
+        local prefix = chunk:gsub("%p", "%%%0")
+        local function place(line)
+            local origin = lines[tonumber(line)]
+            if origin == nil then
+                return nil
+            end
+            return origin[1] .. ":" .. tostring(origin[2])
+        end
+        local mapped = message:gsub(prefix .. ":(%d+)", function(line)
+            return place(line)
+        end)
+        local frames = {}
+        for frame in debug.traceback("", 2):gmatch("[^\\n]+") do
+            local line = frame:match(prefix .. ":(%d+)")
+            local at = line ~= nil and place(line) or nil
+            if at ~= nil then
+                local name = frame:match("function ([%w_.:]+)")
+                frames[#frames + 1] = "    at " .. at .. (name ~= nil and (" (" .. name .. ")") or "")
+            end
+        end
+        if #frames == 0 then
+            return mapped
+        end
+        return mapped .. "\\n" .. table.concat(frames, "\\n")
+    end,
     records = {},
     require = function(name)
         local record = ${G}.records[name]

@@ -19,6 +19,7 @@ import { parse as parseLuau, print as printLuau } from "luau-parser"
 import { parse as parseTilua, analyzeScopes as analyzeScopesTilua, analyzeTypes as analyzeTypesTilua } from "@tilua/parser"
 import { bundle, compile, type BundleResult } from "../src/index.js"
 import { lower } from "../src/lower.js"
+import type { LoweringPlugin } from "../src/lowering.js"
 import * as luau from "../src/luau.js"
 
 let passed = 0
@@ -273,39 +274,94 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
     if (output) check(name, output, expected)
 }
 
-// `console:log` shows a function as the type it was inferred to have and the
-// code it was written as. Neither exists at runtime, so the compiler is the
-// only thing that can say them, and it passes both alongside the value.
+// A library can do more than rename a call: `globalCall` and `globalValue`
+// reach `print(x)` and a bare `print`, and every hook is told where the call
+// was written and what the compiler knew about its arguments — the types and
+// code that no longer exist at runtime. That is what `console:log` in
+// @tilua-types/lua is built on.
 {
-    const analyze = (code: string) => {
+    const seen: unknown[] = []
+    const plugin: LoweringPlugin = {
+        runtime: { log: "local __NAME__ = { lines = __LINES__ }" },
+        methodCall(call) {
+            if (call.receiverGlobal !== "console") return undefined
+            seen.push(call.arguments.map(a => [a.typeText, a.source, a.declaration ?? null, a.spread]))
+            return { callee: `${call.use("log")}.${call.method}`, prepend: [JSON.stringify(`${call.at.file}:${call.at.line}`)], passReceiver: false }
+        },
+        globalCall(call) {
+            if (call.name !== "print") return undefined
+            return { callee: `${call.use("log")}.print`, prepend: [`${call.at.line}`, `${call.at.column}`] }
+        },
+        globalValue(value) {
+            return value.name === "print" ? `${value.use("log")}.printValue` : undefined
+        },
+    }
+    const analyze = (code: string, extra: Partial<Parameters<typeof lower>[2]> = {}) => {
         const program = parseTilua(code)
         const scopes = analyzeScopesTilua(program)
         const result = lower(program, scopes, {
             source: code,
+            file: "src/a.tilua",
             types: analyzeTypesTilua(program, scopes, { diagnostics: false }),
+            lowerings: [{ plugin, from: "test" }],
+            ...extra,
         })
-        return flat(printLuau(luau.program(result.statements)))
+        return { code: flat(printLuau(luau.program(result.statements))), diagnostics: result.diagnostics.map(d => d.message) }
     }
 
-    // Nothing worth saying about a string or a table: no meta at all.
-    check("console: a call with nothing to describe passes no meta",
-        analyze(`console:log("hi", 42)`).includes(`.log(nil, "hi", 42)`), true)
+    check("lowering hooks: a method call on a global gets the call site prepended",
+        analyze(`const double = (x: number) => x * 2\nconsole:log(double, "hi")`).code
+            .endsWith(`tilua_log.log("src/a.tilua:2", double, "hi");`), true)
+    check("lowering hooks: each argument's type, code, and declaration", seen, [[
+        ["(x: number) => number", "double", "(x: number) => x * 2", false],
+        ["\"hi\"", "\"hi\"", null, false],
+    ]])
+    check("lowering hooks: a runtime outside a bundle sees no line map",
+        analyze(`console:log(1)`).code.startsWith("local tilua_log = { lines = nil }"), true)
 
-    // A function is followed back to what it was declared as.
-    const named = analyze("const double = (x: number) => x * 2\nconsole:log(double)")
-    check("console: a function is described by its type and its code", [
-        named.includes(`"(x: number) => number"`),
-        named.includes(`"(x: number) => x * 2"`),
+    check("lowering hooks: a global call, and the same global read as a value", [
+        analyze(`print(1)`).code.endsWith("tilua_log.print(1, 1, 1);"),
+        analyze(`const p = print\np(1)`).code.endsWith("local p = tilua_log.printValue; p(1);"),
     ], [true, true])
 
-    // A local `console` is the author's own, and is left alone.
-    check("console: a local named console is not the language's",
-        analyze("const console = { log: (self: unknown, n: number) => {} }\nconsole:log(1)").includes("console:log(1)"), true)
-
-    check("console: warn and error go through the same runtime", [
-        analyze(`console:warn("careful")`).includes(".warn(nil,"),
-        analyze(`console:error("boom")`).includes(".error(nil,"),
+    // A local of the same name is the author's, and no hook hears of it.
+    check("lowering hooks: a local named like a global is left alone", [
+        analyze("const console = { log: (self: unknown, n: number) => {} }\nconsole:log(1)").code.endsWith("console:log(1);"),
+        analyze("function print(n: number) {}\nprint(1)").code.endsWith("print(1);"),
     ], [true, true])
+
+    const broken: LoweringPlugin = { globalCall: () => ({ callee: "f", prepend: ["1 +"] }) }
+    check("lowering hooks: Luau a library wrote that does not parse is reported",
+        analyze(`print(1)`, { lowerings: [{ plugin: broken, from: "broken" }] }).diagnostics.map(m => m.split(":")[0]),
+        ["'broken' lowered this to Luau that does not parse"])
+}
+
+// An error nothing caught — here `nil.value`, two modules deep — is reported
+// in the project's files, with the way it got there, and then raised.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [] }),
+        "src/util.tilua": "export function boom(t: any): any {\n    const inner = t.missing\n    return inner.value\n}\n",
+        "src/main.tilua": `import { boom } from "./util"\nconst start = {}\nboom(start)\n`,
+    })
+    const result = await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false })
+    if (!luauBinary || result.code === undefined) {
+        skipped++
+    } else {
+        const file = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
+        writeFileSync(file, result.code)
+        let stderr = ""
+        try {
+            execFileSync(luauBinary, [file], { encoding: "utf8", stdio: "pipe" })
+        } catch (error) {
+            stderr = (error as { stderr?: string }).stderr ?? ""
+        }
+        check("bundle: an uncaught runtime error names the project's files", stderr.split(/\r?\n/).slice(0, 3), [
+            "src/util.tilua:3: attempt to index nil with 'value'",
+            "    at src/util.tilua:3 (boom)",
+            "    at src/main.tilua:3 (load)",
+        ])
+    }
 }
 
 // A bundle is one file, so a line in it says nothing about which of the
@@ -507,7 +563,11 @@ function fails(name: string, result: BundleResult, message: string): void {
 {
     const root = project({ "main.tilua": `export const answer = 42\n` })
     const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
-    check("bundle: an entry that exports returns its exports", flat(result.code ?? "").endsWith(`return G.require("main");`), true)
+    check("bundle: an entry that exports returns its exports", flat(result.code ?? "").endsWith(`return result;`), true)
+    // Run under `xpcall`, so an error nothing caught is reported in the
+    // project's files before it is raised again.
+    check("bundle: the entry runs under xpcall", flat(result.code ?? "").includes(
+        `local ok, result = xpcall(function() return G.require("main"); end, G.fail); if not ok then error(result, 0); end`), true)
 }
 
 {

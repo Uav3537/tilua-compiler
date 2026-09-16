@@ -168,6 +168,33 @@ needed it; the receiver becomes the call's first argument unless
 `passReceiver: false`. The last library loaded is asked first, and `undefined`
 leaves an ordinary Luau method call.
 
+Hooks also get the call site (`at`) and what the compiler knew about each
+argument (`arguments`: type, the code it was written as, and what a name was
+declared as). An answer can `prepend` Luau expressions ahead of the written
+arguments. `globalCall` and `globalValue` answer for a global, such as
+`print(x)` or a bare `print`. A runtime can read `__LINES__` to reach the
+bundle's line map. See the `@tilua/parser` README for the details.
+`console:log` is not built into the compiler: `@tilua-types/lua` implements it
+with these hooks.
+
+## Errors at runtime
+
+A bundle is one Luau file, so a position Luau reports names a line of that
+file. The entry therefore runs under `xpcall`. If an error reaches the top,
+its message is rewritten from bundle lines to the places in the project that
+wrote them, a traceback of those places is added, and the error is raised
+again:
+
+```
+src/util.tilua:3: attempt to index nil with 'value'
+    at src/util.tilua:3 (boom)
+    at src/main.tilua:3 (load)
+```
+
+A message that is not a string is raised unchanged. A position that is already
+in the project's files, such as one from `error` in `@tilua-types/lua`, is
+left as it is.
+
 ## Modules
 
 Roblox's `require` takes an Instance, so the bundle has its own. Each module

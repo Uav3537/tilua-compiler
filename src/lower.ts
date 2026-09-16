@@ -34,11 +34,10 @@ import type * as T from "@tilua/parser"
 import type { Binding, BindingId, BuildTarget, ScopeAnalysis, Type, TypeAnalysis } from "@tilua/parser"
 import { formatType } from "@tilua/parser"
 import type * as L from "luau-parser"
-import { parse as parseLuau } from "luau-parser"
+import { parse as parseLuau, parseExpressionFromSource } from "luau-parser"
 import * as luau from "./luau.js"
-import { CONSOLE_RUNTIME } from "./console.js"
 import { Names } from "./names.js"
-import type { LoadedLowering } from "./lowering.js"
+import type { ArgumentInfo, CallSite, LoadedLowering } from "./lowering.js"
 
 /** What lowering a file as a module of a bundle needs. */
 export interface ModuleContext {
@@ -50,9 +49,13 @@ export interface ModuleContext {
     /** The bundle's `require`: an expression that, called with a module's
      *  name, returns its exports table. */
     readonly require: L.Expression
-    /** Luau reaching the bundle's line map — what `console:error` reads to
-     *  name the file a frame was written in. */
+    /** Luau reaching the bundle's line map — what a library's runtime reads,
+     *  as `__LINES__`, to name the file a frame was written in. */
     readonly lines?: string
+    /** Luau reaching the bundle's error reporter — what a library's runtime
+     *  reads, as `__FAIL__`, to report an error from a callback the way an
+     *  error that reached the entry is reported. */
+    readonly fail?: string
 }
 
 export interface LowerOptions {
@@ -70,9 +73,12 @@ export interface LowerOptions {
      *  `loadLowerings`). The compiler lowers the language; a call written
      *  against a library's types is the library's to explain. */
     readonly lowerings?: readonly LoadedLowering[]
-    /** The file's own text, so `console:log` can show a function as the code it
-     *  was written as. Without it a function shows only its type. */
+    /** The file's own text, so a library can be told the code an argument was
+     *  written as (`console:log` shows a function that way). */
     readonly source?: string
+    /** The file as a library's runtime names it — `src/shop/buy.tilua` —
+     *  in the call sites it is handed. */
+    readonly file?: string
     /** Which Lua the output has to run on. Default `"luau"`. `"lua51"` also
      *  lowers what Luau adds to Lua and 5.1 has no syntax for — `a += b`,
      *  `continue`, `if c then a else b` as an expression, `//`. */
@@ -125,7 +131,7 @@ export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerO
 /** A runtime helper the output needs, emitted once at the top of the file.
  *  `assign` and `concat` are the language's own (spreads); a `lowering` is a
  *  table a type library asked for, by the key it gave it. */
-type Helper = "assign" | "concat" | "console" | { lowering: number; runtime: string }
+type Helper = "assign" | "concat" | { lowering: number; runtime: string }
 
 type Mode = "declare" | "assign"
 
@@ -220,7 +226,7 @@ class Lowerer {
         return luau.identifier(local)
     }
 
-    private helper(kind: "assign" | "concat" | "console"): L.Identifier {
+    private helper(kind: "assign" | "concat"): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
             name = this.names.fresh(`tilua_${kind}`)
@@ -246,67 +252,9 @@ class Lowerer {
     private readonly loweringNames = new Map<string, string>()
     private readonly loweringUsed: { index: number; runtime: string; name: string }[] = []
 
-    /** What a library says `receiver:method(...)` is. The last library
-     *  loaded is asked first, so a project's own library can answer for a
-     *  method an earlier one also claims; no answer leaves an ordinary Luau
-     *  method call, which is what a value that answers to the method itself
-     *  wants (`text:upper()`). */
-    /** `console:log(a, f)` and its two siblings.
-     *
-     *  Handled here rather than through a library's lowering because what they
-     *  need is not a different callee but *more than was written*: a function
-     *  prints as its type and its code, and neither survives to runtime. The
-     *  compiler is the only thing that has both, so it passes them along:
-     *
-     *      console:log(a, double)
-     *      -- becomes
-     *      tilua_console.log({ [2] = { "(x: number) => number", "(x: number) => x * 2" } }, a, double)
-     *
-     *  The meta table is `nil` when nothing was worth saying, which is most
-     *  calls. `console` itself is never passed: it holds nothing. */
-    private consoleCall(node: T.MethodCallExpression): L.Expression | undefined {
-        if (node.object.type !== "Identifier" || node.object.name !== "console") return undefined
-        const method = node.method.name
-        if (method !== "log" && method !== "warn" && method !== "error") return undefined
-        // A local named `console` is the author's, not the language's.
-        const binding = this.scopes.bindingOf.get(node.object)
-        if (binding !== undefined && this.scopes.bindings.get(binding)?.kind !== "global") return undefined
-
-        const meta = this.consoleMeta(node.arguments)
-        return luau.call(
-            luau.member(this.helper("console"), method),
-            [meta ?? luau.nil(), ...this.values(node.arguments)],
-        )
-    }
-
-    /** What the compiler knows about the arguments and the runtime cannot:
-     *  for each function argument, the type it was inferred as and the code it
-     *  was written as. Keyed by position, so an argument that needs nothing
-     *  costs nothing. */
-    private consoleMeta(args: readonly T.Expression[]): L.Expression | undefined {
-        const fields: L.TableField[] = []
-        args.forEach((argument, index) => {
-            const type = this.options.types?.typeOf.get(argument)
-            if (!type || !isFunctionType(type)) return
-            // `console:log(double)` should show what `double` *is*, not the
-            // four letters at the call. The name is followed back to what it
-            // was declared as.
-            const written = this.writtenSource(this.declarationOf(argument) ?? argument)
-            fields.push({
-                type: "TableFieldComputed",
-                key: luau.number(index + 1),
-                value: luau.table([
-                    { type: "TableFieldPositional", value: luau.string(formatType(type)) },
-                    { type: "TableFieldPositional", value: luau.string(written) },
-                ]),
-            })
-        })
-        return fields.length ? luau.table(fields) : undefined
-    }
-
     /** What a name was declared as: the value of `const f = ...`, or the whole
-     *  `function f() { ... }`. Built once, on the first `console` call that
-     *  needs it — most files have none. */
+     *  `function f() { ... }`. Built once, on the first call a library asks
+     *  about — most files have none. */
     private declarationOf(argument: T.Expression): T.BaseNode | undefined {
         if (argument.type !== "Identifier") return undefined
         if (!this.declarations) {
@@ -350,20 +298,131 @@ class Lowerer {
         return [first, ...middle.map(trim), trim(last)].join("\n")
     }
 
-    private loweredMethodCall(node: T.MethodCallExpression): { callee: string; passReceiver: boolean } | undefined {
+    /** Where `node` was written, as a library is told it. */
+    private callSite(node: T.BaseNode): CallSite {
+        return { file: this.options.file, line: node.line.start, column: node.column.start }
+    }
+
+    /** What the compiler knows about each argument and the runtime cannot:
+     *  its type, and the code it — or what it names — was written as. Built
+     *  only if a library reads it. */
+    private argumentInfo(args: readonly T.Expression[]): ArgumentInfo[] {
+        return args.map(argument => {
+            const declaration = this.declarationOf(argument)
+            const type = this.options.types?.typeOf.get(argument)
+            return {
+                type,
+                typeText: type ? formatType(type) : undefined,
+                source: this.writtenSource(argument),
+                declaration: declaration ? this.writtenSource(declaration) : undefined,
+                spread: argument.type === "SpreadElement",
+            }
+        })
+    }
+
+    /** The name a global is read by at `node`, or `undefined` when `node` is
+     *  not a global — a local of the same name is the author's. */
+    private globalName(node: T.Expression): string | undefined {
+        if (node.type !== "Identifier") return undefined
+        const id = this.scopes.bindingOf.get(node)
+        if (id === undefined) return node.name
+        return this.scopes.bindings.get(id)?.kind === "global" ? node.name : undefined
+    }
+
+    /** What a library says `receiver:method(...)` is. The last library
+     *  loaded is asked first, so a project's own library can answer for a
+     *  method an earlier one also claims; no answer leaves an ordinary Luau
+     *  method call, which is what a value that answers to the method itself
+     *  wants (`text:upper()`). */
+    private loweredMethodCall(node: T.MethodCallExpression): { callee: string; prepend: L.Expression[]; passReceiver: boolean } | undefined {
         const lowerings = this.options.lowerings
-        if (!lowerings?.length) return undefined
+        if (!lowerings?.some(l => l.plugin.methodCall)) return undefined
         const receiver = this.options.types?.typeOf.get(node.object)
+        const receiverGlobal = this.globalName(node.object)
+        const info = this.lazyArguments(node.arguments)
         for (let i = lowerings.length - 1; i >= 0; i--) {
-            const answer = lowerings[i].plugin.methodCall?.({
+            const plugin = lowerings[i].plugin
+            if (!plugin.methodCall) continue
+            const answer = plugin.methodCall({
                 method: node.method.name,
                 receiver,
+                receiverGlobal,
                 argumentCount: node.arguments.length,
+                at: this.callSite(node.method),
+                get arguments() { return info() },
                 use: runtime => this.loweringRuntime(i, runtime),
             })
-            if (answer) return { callee: answer.callee, passReceiver: answer.passReceiver !== false }
+            if (answer) {
+                return {
+                    callee: answer.callee,
+                    prepend: this.prepended(answer.prepend, i, node),
+                    passReceiver: answer.passReceiver !== false,
+                }
+            }
         }
         return undefined
+    }
+
+    /** What a library says a call to a global — `print(x)` — is. */
+    private loweredGlobalCall(node: T.CallExpression): { callee: string; prepend: L.Expression[] } | undefined {
+        const lowerings = this.options.lowerings
+        if (!lowerings?.some(l => l.plugin.globalCall)) return undefined
+        const name = this.globalName(node.callee)
+        if (name === undefined) return undefined
+        const info = this.lazyArguments(node.arguments)
+        for (let i = lowerings.length - 1; i >= 0; i--) {
+            const plugin = lowerings[i].plugin
+            if (!plugin.globalCall) continue
+            const answer = plugin.globalCall({
+                name,
+                at: this.callSite(node.callee),
+                get arguments() { return info() },
+                use: runtime => this.loweringRuntime(i, runtime),
+            })
+            if (answer) return { callee: answer.callee, prepend: this.prepended(answer.prepend, i, node) }
+        }
+        return undefined
+    }
+
+    /** What a library says a global read as a value — `local p = print` — is. */
+    private loweredGlobalValue(node: T.Identifier): L.Expression | undefined {
+        const lowerings = this.options.lowerings
+        if (!lowerings?.some(l => l.plugin.globalValue)) return undefined
+        const name = this.globalName(node)
+        if (name === undefined) return undefined
+        for (let i = lowerings.length - 1; i >= 0; i--) {
+            const answer = lowerings[i].plugin.globalValue?.({
+                name,
+                at: this.callSite(node),
+                use: runtime => this.loweringRuntime(i, runtime),
+            })
+            if (answer !== undefined) return this.libraryExpression(answer, i, node)
+        }
+        return undefined
+    }
+
+    private lazyArguments(args: readonly T.Expression[]): () => ArgumentInfo[] {
+        let info: ArgumentInfo[] | undefined
+        return () => (info ??= this.argumentInfo(args))
+    }
+
+    private prepended(sources: readonly string[] | undefined, index: number, node: T.BaseNode): L.Expression[] {
+        return (sources ?? []).flatMap(source => {
+            const expression = this.libraryExpression(source, index, node)
+            return expression ? [expression] : []
+        })
+    }
+
+    /** Luau a library wrote as an expression. One that does not parse is the
+     *  library's mistake, reported at the call it was written for. */
+    private libraryExpression(source: string, index: number, node: T.BaseNode): L.Expression | undefined {
+        try {
+            return parseExpressionFromSource(source)
+        } catch (error) {
+            this.report(node, `'${this.options.lowerings![index].from}' lowered this to Luau that does not parse: `
+                + `${JSON.stringify(source)} (${(error as Error).message})`)
+            return undefined
+        }
     }
 
     private helperDefinitions(): L.Statement[] {
@@ -393,17 +452,15 @@ class Lowerer {
                 })
                 continue
             }
-            out.push(...parseLuau(source.replace(/__NAME__/g, name)).body.statements)
-        }
-        const console = this.helpers.get("console")
-        if (console) {
             // The map lives on the bundle's own table, so the expression that
             // reaches it comes from the bundler. Compiled as a single file
             // there is no bundle and no map: positions stay Luau's own.
             const lines = this.options.module?.lines ?? "nil"
-            out.push(...parseLuau(CONSOLE_RUNTIME
-                .replace(/__NAME__/g, console)
-                .replace(/__LINES__/g, lines)).body.statements)
+            const fail = this.options.module?.fail ?? "nil"
+            out.push(...parseLuau(source
+                .replace(/__NAME__/g, name)
+                .replace(/__LINES__/g, lines)
+                .replace(/__FAIL__/g, fail)).body.statements)
         }
         const concat = this.helpers.get("concat")
         if (concat) {
@@ -1398,7 +1455,7 @@ end
             }
         }
         switch (node.type) {
-            case "Identifier": return this.reference(node)
+            case "Identifier": return this.loweredGlobalValue(node) ?? this.reference(node)
             case "NilLiteral": return luau.nil()
             case "BooleanLiteral": return luau.boolean(node.value)
             case "NumberLiteral": return luau.number(node.value, this.numberRaw(node))
@@ -1450,7 +1507,14 @@ end
             case "MethodCallExpression": {
                 const chain = optionalChain(node)
                 if (chain) return this.optionalChainExpression(chain)
-                return this.link(node, this.expression(linkObject(node)))
+                // A name that is called is not read as a value: `print(x)` is
+                // `globalCall`'s to answer, and asking `globalValue` about the
+                // `print` in it would emit a runtime nothing then uses.
+                const object = linkObject(node)
+                if (node.type === "CallExpression" && object.type === "Identifier") {
+                    return this.link(node, this.reference(object))
+                }
+                return this.link(node, this.expression(object))
             }
 
             case "ParenthesizedExpression":
@@ -1499,15 +1563,21 @@ end
                 return luau.member(object, node.property.name)
             case "IndexExpression":
                 return luau.index(object, this.expression(node.index))
-            case "CallExpression":
-                return luau.call(object, this.values(node.arguments))
-            case "MethodCallExpression": {
-                const consoleCall = this.consoleCall(node)
-                if (consoleCall) return consoleCall
+            case "CallExpression": {
+                const lowered = this.loweredGlobalCall(node)
                 const args = this.values(node.arguments)
+                if (lowered) return luau.call(calleePath(lowered.callee), [...lowered.prepend, ...args])
+                return luau.call(object, args)
+            }
+            case "MethodCallExpression": {
                 const lowered = this.loweredMethodCall(node)
+                const args = this.values(node.arguments)
                 if (lowered) {
-                    return luau.call(calleePath(lowered.callee), lowered.passReceiver ? [object, ...args] : args)
+                    return luau.call(calleePath(lowered.callee), [
+                        ...lowered.prepend,
+                        ...(lowered.passReceiver ? [object] : []),
+                        ...args,
+                    ])
                 }
                 if (!luau.isLuauName(node.method.name)) {
                     this.report(node.method, `'${node.method.name}' is a Luau keyword and cannot be called with ':'`)
