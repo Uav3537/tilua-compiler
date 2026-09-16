@@ -527,6 +527,23 @@ function fails(name: string, result: BundleResult, message: string): void {
 }
 
 {
+    // `pairs(t)` is typed as a pack — the iterator triplet — not as a table.
+    // Lowering used to read that pack as a table iterated directly and insert
+    // a `_` key variable, which bound the loop's one name to the value.
+    const root = project({
+        "defs.d.tilua": `declare function pairs<T>(t: T): ((t: T, key?: unknown) => (unknown, unknown), T, nil)\n`,
+        "main.tilua": [
+            `const scores: { [string]: number } = { a: 1 }`,
+            `for (key in pairs(scores)) { print(key) }`,
+        ].join("\n") + "\n",
+    })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: ["./defs.d.tilua"] } })
+    check("a typed pairs() keeps the loop's one variable on the key",
+        result.code?.includes("for key in pairs(scores) do"), true)
+    runs("a typed pairs() iterates keys", result, ["a"])
+}
+
+{
     // Most of the language in one program, checked by what it prints.
     const root = project({
         "main.tilua": [

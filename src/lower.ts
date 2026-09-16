@@ -617,37 +617,6 @@ class Lowerer {
         return [...declarations, ...hoisted, ...requires, ...body]
     }
 
-    /** Is `expression` a table iterated directly — not an iterator function
-     *  such as `pairs(t)` or `string.gmatch(s, p)`? Known from its type. */
-    private iteratesTable(expression: T.Expression): boolean {
-        const types = this.options.types
-        const type = types?.typeOf.get(expression)
-        if (!types || !type) return false
-        const seen = new Set<Type>()
-        const table = (t: Type): boolean => {
-            if (seen.has(t)) return false
-            seen.add(t)
-            switch (t.kind) {
-                case "array":
-                case "tuple":
-                    return true
-                case "object":
-                    return !t.class
-                case "union":
-                    return t.types.every(m => (m.kind === "primitive" && m.name === "nil") || table(m))
-                case "intersection":
-                    return t.types.some(table)
-                case "genericRef": {
-                    const alias = types.aliases.get(t.name)
-                    return alias !== undefined && table(alias)
-                }
-                default:
-                    return false
-            }
-        }
-        return table(type)
-    }
-
     private isRewritten(node: object): boolean {
         const binding = this.bindingByDeclaration.get(node)
         return binding !== undefined && this.rewrites.has(binding.id)
@@ -907,9 +876,11 @@ class Lowerer {
                     prelude.push(...this.destructure(target, luau.identifier(temp), "declare"))
                     return temp
                 })
-                // `for x in list` yields the values in tilua, as its types say;
-                // Luau yields the keys first.
-                if (variables.length === 1 && node.iterators.length === 1 && this.iteratesTable(node.iterators[0])) {
+                // `for x in list` yields the values in tilua; Luau yields the
+                // keys first. Which loops those are is the type analysis's
+                // call — it binds the variable's type from the same choice, so
+                // asking it is what keeps the name and its type in step.
+                if (variables.length === 1 && this.options.types?.iteratesValues.has(node)) {
                     variables.unshift(this.names.fresh("_"))
                 }
                 return [luau.genericFor(variables, node.iterators.map(e => this.expression(e)),
