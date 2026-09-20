@@ -39,7 +39,7 @@
  *     so are re-exports (`links`) and `export *` (`stars`), which the table
  *     looks up in the other module on every read.
  */
-import { readFileSync } from "node:fs"
+import { readFileSync, statSync } from "node:fs"
 import { dirname, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries,
@@ -382,7 +382,30 @@ ${G} = {
 `
 }
 
+/** A file's size and when it was last written — what says whether anything
+ *  remembered about it still holds. An unreadable file has no stamp, and
+ *  nothing about it is kept. */
+function stampOf(file: string): string | undefined {
+    try {
+        const at = statSync(file)
+        return `${at.size}:${at.mtimeMs}`
+    } catch {
+        return undefined
+    }
+}
+
+/** Files parsed in this process, by what they were when they were read. A
+ *  build that runs again — a watch, or several entry points over one project
+ *  — reads each file once. */
+const parsedFiles = new Map<string, { stamp: string; program: Program; text: string; directives: Directives }>()
+
 function parseFile(file: string, diagnostics: BundleDiagnostic[], directives: Map<string, Directives>): { program: Program; text: string } | undefined {
+    const stamp = stampOf(file)
+    const cached = stamp !== undefined ? parsedFiles.get(file) : undefined
+    if (cached && cached.stamp === stamp) {
+        directives.set(file, cached.directives)
+        return { program: cached.program, text: cached.text }
+    }
     let text: string
     try {
         text = readFileSync(file, "utf8")
@@ -392,7 +415,9 @@ function parseFile(file: string, diagnostics: BundleDiagnostic[], directives: Ma
     }
     try {
         const program = parse(text)
-        directives.set(file, directivesOf(text))
+        const found = directivesOf(text)
+        directives.set(file, found)
+        if (stamp !== undefined) parsedFiles.set(file, { stamp, program, text, directives: found })
         return { program, text }
     } catch (error) {
         if (error instanceof ParseError || error instanceof LexError) {
@@ -411,6 +436,38 @@ function importedSpecifiers(program: Program): string[] {
             : [])
 }
 
+/** Definitions files, parsed once per process. A project's Roblox library is
+ *  twenty thousand lines that every entry point would otherwise read again,
+ *  and the tree is only read from — never changed by an analysis. The file's
+ *  size and modification time say when it has to be read anew. */
+const libraryCache = new Map<string, { stamp: string; program: Program }>()
+
+function parsedLibrary(file: string): Program {
+    let stamp: string
+    try {
+        const at = statSync(file)
+        stamp = `${at.size}:${at.mtimeMs}`
+    } catch {
+        stamp = ""
+    }
+    const cached = libraryCache.get(file)
+    if (cached && cached.stamp === stamp) return cached.program
+    const program = parse(readFileSync(file, "utf8"))
+    libraryCache.set(file, { stamp, program })
+    return program
+}
+
+/** What each module's analysis was, and what it depended on. A second build in
+ *  the same process — the next entry point, or a watch's next run — keeps the
+ *  analysis of every module whose files are still what they were. */
+const moduleAnalyses = new Map<string, {
+    setting: string
+    libs: readonly Program[]
+    program: Program
+    read: Map<string, string>
+    result: { types: TypeAnalysis; diagnostics: BundleDiagnostic[] }
+}>()
+
 /** Every module's types, and its type errors, against the config's type libraries. */
 function analyzeModules(
     modules: SourceModule[],
@@ -425,18 +482,95 @@ function analyzeModules(
     const libraries = config ? resolveTypeLibraries(config) : { files: [], lowerings: [], problems: [] }
     for (const p of libraries.problems) out.push({ file: p.file, message: p.message, line: p.line ?? 1, column: p.column ?? 1, category: "config" })
 
-    const libs = libraries.files.map(file => parse(readFileSync(file, "utf8")))
+    const libs = libraries.files.map(parsedLibrary)
     const globals = libs.flatMap(lib => lib.body.statements.flatMap(s => (s.type === "DeclareStatement" ? [s.name] : [])))
 
     const byFile = new Map(modules.map(m => [m.file, m]))
     const exportsCache = new Map<string, ModuleExports>()
     const inProgress = new Set<string>()
+    /** Each module is analyzed once, whether an import asked for it first or
+     *  the loop below reached it: the analysis an import needs is the same one
+     *  the module is compiled from, diagnostics and all. */
+    const analyzed = new Map<string, { types: TypeAnalysis; diagnostics: BundleDiagnostic[] }>()
+    /** How often a cycle has handed out partial exports. An analysis that saw
+     *  one is not kept: what it read was not the whole module. */
+    let partials = 0
+    /** What each module read while it was analyzed — itself and, through its
+     *  imports, every module below it. An analysis holds only as long as all
+     *  of them are the files they were. */
+    const readWhile = new Map<string, Map<string, string>>()
+    const settingFor = `${libraries.files.join("|")}#${config?.directory ?? ""}#${JSON.stringify(config?.paths ?? {})}`
+
+    const analyzeModule = (file: string, program: Program): { types: TypeAnalysis; diagnostics: BundleDiagnostic[] } => {
+        const done = analyzed.get(file)
+        if (done) return done
+        const remembered = moduleAnalyses.get(file)
+        if (remembered && remembered.setting === settingFor && libs.length === remembered.libs.length
+            && remembered.libs.every((lib, i) => lib === libs[i])
+            && remembered.program === program
+            && [...remembered.read].every(([read, stamp]) => stampOf(read) === stamp)) {
+            analyzed.set(file, remembered.result)
+            readWhile.set(file, remembered.read)
+            return remembered.result
+        }
+        // Without a type library even `print` is undeclared: only check names
+        // against libraries that are there.
+        const scopes = analyzeScopes(program, { builtinGlobals: globals, reportUndeclared: libs.length > 0 })
+        const said: BundleDiagnostic[] = []
+        // A name nothing declares is reported, but builds: in Luau it is a
+        // global that reads as nil, not a program that cannot be compiled.
+        for (const d of scopes.diagnostics) {
+            if (d.kind !== "undeclared") continue
+            said.push({ file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "type" })
+        }
+        const before = partials
+        const types = analyzeTypes(program, scopes, {
+            libs,
+            resolveModule: resolverFor(file),
+            reportUnknownTypes: libs.length > 0,
+        })
+        for (const d of types.diagnostics) {
+            const at = d.node as { line: { start: number }; column: { start: number } }
+            said.push({ file, message: d.message, line: at.line.start, column: at.column.start, category: "type" })
+        }
+        const result = { types, diagnostics: said }
+        if (partials === before) {
+            analyzed.set(file, result)
+            const read = readWhile.get(file) ?? new Map<string, string>()
+            const own = stampOf(file)
+            if (own !== undefined) read.set(file, own)
+            readWhile.set(file, read)
+            // Only a module whose every file was readable is worth keeping:
+            // one that was not may become readable, and change the answer.
+            if ([...read.values()].every(stamp => stamp !== undefined)) {
+                moduleAnalyses.set(file, { setting: settingFor, libs: [...libs], program, read, result })
+            }
+        }
+        return result
+    }
+
     const resolverFor = (file: string) => (specifier: string): ModuleExports | undefined => {
         const target = resolveModulePath(file, specifier, config)
         if (!target) return undefined
-        if (inProgress.has(target)) return { values: new Map(), types: new Map(), partial: true }
+        // What this module read, and what that module had read in turn: any of
+        // them changing means this analysis has to happen again. Taken after
+        // the import is resolved, so the one below is complete.
+        const noteRead = (): void => {
+            const read = readWhile.get(file) ?? new Map<string, string>()
+            readWhile.set(file, read)
+            const stamp = stampOf(target)
+            if (stamp !== undefined) read.set(target, stamp)
+            for (const [below, belowStamp] of readWhile.get(target) ?? []) read.set(below, belowStamp)
+        }
+        if (inProgress.has(target)) {
+            partials++
+            return { values: new Map(), types: new Map(), partial: true }
+        }
         const cached = exportsCache.get(target)
-        if (cached) return cached
+        if (cached) {
+            noteRead()
+            return cached
+        }
         let program = byFile.get(target)?.program
         if (!program) {
             try {
@@ -448,9 +582,12 @@ function analyzeModules(
         inProgress.add(target)
         try {
             const scopes = analyzeScopes(program, { builtinGlobals: globals })
-            const types = analyzeTypes(program, scopes, { libs, resolveModule: resolverFor(target), diagnostics: false })
+            const types = byFile.has(target)
+                ? analyzeModule(target, program).types
+                : analyzeTypes(program, scopes, { libs, resolveModule: resolverFor(target), diagnostics: false })
             const exports = moduleExports(program, scopes, types, resolverFor(target))
             exportsCache.set(target, exports)
+            noteRead()
             return exports
         } finally {
             inProgress.delete(target)
@@ -458,25 +595,9 @@ function analyzeModules(
     }
 
     for (const module of modules) {
-        // Without a type library even `print` is undeclared: only check names
-        // against libraries that are there.
-        const scopes = analyzeScopes(module.program, { builtinGlobals: globals, reportUndeclared: libs.length > 0 })
-        // A name nothing declares is reported, but builds: in Luau it is a
-        // global that reads as nil, not a program that cannot be compiled.
-        for (const d of scopes.diagnostics) {
-            if (d.kind !== "undeclared") continue
-            out.push({ file: module.file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "type" })
-        }
-        const types = analyzeTypes(module.program, scopes, {
-            libs,
-            resolveModule: resolverFor(module.file),
-            reportUnknownTypes: libs.length > 0,
-        })
+        const { types, diagnostics } = analyzeModule(module.file, module.program)
         analyses.set(module.file, types)
-        for (const d of types.diagnostics) {
-            const at = d.node as { line: { start: number }; column: { start: number } }
-            out.push({ file: module.file, message: d.message, line: at.line.start, column: at.column.start, category: "type" })
-        }
+        out.push(...diagnostics)
     }
     return { types: analyses, diagnostics: out, lowerings: [...libraries.lowerings] }
 }

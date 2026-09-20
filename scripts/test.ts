@@ -228,6 +228,10 @@ await lowers("generated names avoid the source's", "const ref = 1\nconst { a } =
 
 await lowers("a table is walked for its values", "const list = [1, 2]\nfor (const v in list) { print(v) }",
     "local list = { 1, 2 }; for _, v in list do print(v); end;")
+await lowers("an optional read of a key stops the chain",
+    "declare maps: { [string]: { label: string } } | nil\ndeclare key: string\nconst named = maps?.[key]?.label",
+    "local named = (function() local ref = maps; if ref == nil then return nil; end; ref = ref[key];"
+    + " if ref == nil then return nil; end; return ref.label; end)();")
 await lowers("an iterator function is the loop's own",
     "declare step: () => number | nil\nfor (const n in step) { print(n) }", "for n in step do print(n); end;")
 await lowers("an iteration is the three Luau loops with, taken out of the array it is",
@@ -1291,6 +1295,30 @@ await lowers("class: new is a call of the class's own constructor",
         (result.code ?? "").includes("class[key] = base[key]"),
     ], [0, true, true])
     if (result.code) validLuau("class: metamethods lower to valid Luau", result.code)
+}
+
+// A second build in the same process keeps what has not changed — and must
+// not keep what has. A module rewritten between builds is read again, types
+// and all, and so is every module that imports it.
+{
+    const root = project({
+        "main.tilua": `import { size } from "./box"\nconst n: number = size()\nprint(n)\n`,
+        "box.tilua": `export function size(): number { return 1 }\n`,
+    })
+    const first = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
+    // The same name, a different type: what imports it can no longer fit.
+    await new Promise(resolve => setTimeout(resolve, 10))
+    writeFileSync(join(root, "box.tilua"), `export function size(): string { return "1" }\n`)
+    const second = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
+    check("a rewritten module is analyzed again on the next build", [
+        first.diagnostics.map(d => d.message),
+        second.diagnostics.map(d => d.message),
+        second.code?.includes('return "1"'),
+    ], [
+        [],
+        ["Type 'string' is not assignable to 'number'"],
+        true,
+    ])
 }
 
 for (const failure of failures) console.log(`FAIL ${failure}`)
