@@ -148,7 +148,13 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const names = Names.from(...[...sources.values()].map(s => s.program))
     const G = names.fresh("G")
     const requireExpression = luau.member(luau.identifier(G), "require")
-    const modules = new Map<string, { name: string; statements: LuauStatement[]; exportsName: string; info: ModuleInfo }>()
+    const modules = new Map<string, {
+        name: string
+        statements: LuauStatement[]
+        exportsName: string
+        info: ModuleInfo
+        usesScriptArgs: boolean
+    }>()
     // Where every emitted statement was written, across all the modules. The
     // bundle is one file, so this is the only way back to the project.
     const origins = new WeakMap<LuauStatement, Origin>()
@@ -188,6 +194,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
             statements: lowered.statements,
             exportsName: lowered.exportsName,
             info: lowered.module,
+            usesScriptArgs: lowered.usesScriptArgs,
         })
     }
 
@@ -220,6 +227,11 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
 
     const program = parseLuau(runtime(G))
     const assignment = program.body.statements[1]
+    // `scriptArgs` is what the bundle was started with — the chunk's own
+    // `...` — and every module reaches it, so it comes before them all.
+    if ([...modules.values()].some(m => m.usesScriptArgs)) {
+        program.body.statements.unshift(luau.local(["scriptArgs"], [luau.table([{ type: "TableFieldPositional", value: { type: "VarargExpression" } as never }])]))
+    }
     const modulesTable = assignment.type === "AssignmentStatement" && assignment.values[0].type === "TableExpression"
         ? (assignment.values[0].fields.find(f => f.type === "TableFieldNamed" && f.name.name === "modules") as { value: TableExpression } | undefined)?.value
         : undefined

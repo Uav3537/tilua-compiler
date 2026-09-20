@@ -199,6 +199,12 @@ await lowers("object spread copies in order",
 await lowers("array spread joins the runs",
     "const xs = [f(), ...ys, g()]",
     `local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { (g()) });`)
+// Luau only calls a method on a string in parentheses; tilua lets it go bare.
+await lowers("a method call on a bare string gets its parentheses",
+    `const a = "a":upper():rep(2)
+print("b":lower())`, `local a = ("a"):upper():rep(2); print((("b"):lower()));`)
+await lowers("a method call on a bare template string", "print(`${a}!`:upper())",
+    `print((("%s!"):format(tostring(a)):upper()));`)
 await lowers("interpolation becomes format", "print(`${a} any`)", `print(("%s any"):format(tostring(a)));`)
 await lowers("interpolation escapes percent signs and keeps braces",
     "print(`${n}% of {total}`)", `print(("%s%% of {total}"):format(tostring(n)));`)
@@ -214,14 +220,19 @@ await lowers("methods keep ':' and drop the injected self",
 await lowers("function expressions", "const f = function(a = 2) { return a }", "local f = function(a) if a == nil then a = 2; end; return a; end;")
 
 // --- statements and names --------------------------------------------------------
-await lowers("for-in patterns", "for (_, { name } in pairs(t)) {\n    print(name)\n}", "for _, item in pairs(t) do local name = item.name; print(name); end;")
+await lowers("for-in patterns", "const list = [{ name: \"a\" }]\nfor (const { name } in list) {\n    print(name)\n}",
+    'local list = { { name = "a" } }; for _, item in list do local name = item.name; print(name); end;')
 await lowers("if expressions", "const v = if a then 1 elseif b then 2 else 3", "local v = if a then 1 elseif b then 2 else 3;")
 await lowers("a Luau keyword used as a name", "let local = 1\nprint(t.local, local)", `local local_ = 1; print(t["local"], local_);`)
 await lowers("generated names avoid the source's", "const ref = 1\nconst { a } = f()", "local ref = 1; local ref2 = f(); local a = ref2.a;")
 
-await lowers("for x in a table yields the values", "const list = [1, 2]\nfor (v in list) { print(v) }",
+await lowers("a table is walked for its values", "const list = [1, 2]\nfor (const v in list) { print(v) }",
     "local list = { 1, 2 }; for _, v in list do print(v); end;")
-await lowers("an iterator function keeps its own values", "for (k in pairs(t)) { print(k) }", "for k in pairs(t) do print(k); end;")
+await lowers("an iterator function is the loop's own",
+    "declare step: () => number | nil\nfor (const n in step) { print(n) }", "for n in step do print(n); end;")
+await lowers("an iteration is the three Luau loops with, taken out of the array it is",
+    "declare walk: [(s: nil, previous: number | nil) => number | nil, nil, nil]\nfor (const n in walk) { print(n) }",
+    "for n in unpack(walk, 1, 3) do print(n); end;")
 await lowers("attributes are kept", "@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
 await lowers("a shadowed global the output needs is captured first",
     "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
@@ -587,20 +598,25 @@ function fails(name: string, result: BundleResult, message: string): void {
 }
 
 {
-    // `pairs(t)` is typed as a pack — the iterator triplet — not as a table.
-    // Lowering used to read that pack as a table iterated directly and insert
-    // a `_` key variable, which bound the loop's one name to the value.
+    // An iteration is `[step, state, first]` — an array like any other, which
+    // the loop takes the three of, rather than a table it walks the values of.
     const root = project({
-        "defs.d.tilua": `declare function pairs<T>(t: T): ((t: T, key?: unknown) => (unknown, unknown), T, nil)\n`,
         "main.tilua": [
-            `const scores: { [string]: number } = { a: 1 }`,
-            `for (key in pairs(scores)) { print(key) }`,
+            `const names = ["a", "b"]`,
+            `type Walk = [(t: string[], previous: [number, string] | nil) => [number, string] | nil, string[], nil]`,
+            `const walk: Walk = [function(t, previous) {`,
+            `    const i = if previous == nil then 1 else previous[1] + 1`,
+            `    const name = t[i]`,
+            `    if (name == nil) { return nil }`,
+            `    return [i, name]`,
+            `}, names, nil]`,
+            'for (const [i, name] in walk) { print(`${i}${name}`) }',
         ].join("\n") + "\n",
     })
-    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: ["./defs.d.tilua"] } })
-    check("a typed pairs() keeps the loop's one variable on the key",
-        result.code?.includes("for key in pairs(scores) do"), true)
-    runs("a typed pairs() iterates keys", result, ["a"])
+    const result = await bundle({ entry: join(root, "main.tilua") })
+    check("an iteration is looped with as its three parts",
+        result.code?.includes("for item in unpack(walk, 1, 3) do"), true)
+    runs("an iteration walks what its steps answer", result, ["1a", "2b"])
 }
 
 {
@@ -613,20 +629,20 @@ function fails(name: string, result: BundleResult, message: string): void {
             `const point: Point = { x: 1, y: 2 }`,
             `const { x, y: py = 9, ...others } = { ...point, z: 3, w: 4 }`,
             `let count = 0`,
-            `for (key in pairs(others)) { count += 1 }`,
+            `for (const key in pairs(others)) { count += 1 }`,
             `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
             `function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number {`,
             `    return (a + b) * scale`,
             `}`,
             `const values = [0, ...[1, 2], sum({ a: 1 }), sum({ a: 1, b: 1 }, 2)]`,
             `let total = 0`,
-            `for (v in values) { total += v }`,
+            `for (const v in values) { total += v }`,
             `const stack = Stack.new()`,
             `stack:push(5)`,
             `const label = if total > 10 then "big" else "small"`,
             `let a, b = 1, 2`,
             `{ a, b } = { a: b, b: a }`,
-            `print(\`\${x} \${py} \${count} \${first} \${third} \${#tail} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...)`,
+            `print(\`\${x} \${py} \${count} \${first} \${third} \${#tail} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...scriptArgs)`,
         ].join("\n"),
         "stack.tilua": [
         "export const Stack = {}",
@@ -658,7 +674,7 @@ function fails(name: string, result: BundleResult, message: string): void {
 {
     const root = project({
         "main.tilua": [
-        "type Node = { name: string, child: Node | nil, greet: (self: Node, suffix: string) => string, pair: () => (number, number) }",
+        "type Node = { name: string, child: Node | nil, greet: (self: Node, suffix: string) => string, pair: () => [number, number] }",
         "let reads = 0",
         "let argued = 0",
         "function arg(): string {",
@@ -666,7 +682,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         "    return \"!\"",
         "}",
         "function make(name: string, child: Node | nil): Node {",
-        "    return { name, child, greet: function(self: Node, suffix: string): string { return self.name .. suffix }, pair: function(): (number, number) { return 1, 2 } }",
+        "    return { name, child, greet: function(self: Node, suffix: string): string { return self.name .. suffix }, pair: function(): [number, number] { return [1, 2] } }",
         "}",
         "const leaf = make(\"leaf\", nil)",
         "const root = make(\"root\", leaf)",
@@ -679,13 +695,14 @@ function fails(name: string, result: BundleResult, message: string): void {
         "print(root?:greet(arg()), none?:greet(arg()), argued)",
         "print(get(root)?.child?.name, get(none)?.child?.name, reads)",
         "print(root?.child:greet(\"?\"), (none?.child) == nil)",
-        "print(root?.pair())",
+        "const [first, second] = root.pair()",
+        "print(first, second)",
         "none?:greet(arg())",
         "root?.child?:greet(arg())",
         "get(root)?.child?:greet(arg())",
         "print(argued, reads)",
-        "function spread(...: Node | nil): string | nil {",
-        "    return (...)?.child?.name",
+        "function spread(...nodes: (Node | nil)[]): string | nil {",
+        "    return nodes[1]?.child?.name",
         "}",
         "print(spread(root), spread(nil))",
         "",
@@ -735,7 +752,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         tilua: { types: "index.d.tilua", lowering: "lowering.mjs", ...extra },
     })
     const definitions = [
-        "declare function print(...: unknown): ()",
+        "declare function print(...args: unknown[]): nil",
         "type ArrayMethods<T> = { first: (self: T[]) => T | nil, nope: (self: T[]) => T | nil }",
         "type StringMethods = { shout: (self: string) => string }",
     ].join("\n")
@@ -833,7 +850,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         ["4: Type '\"x\"' is not assignable to 'number'", "4: Unused '@tilua-expect-error' directive", "5: Unused '@tilua-expect-error' directive"])
     const unknown = project({
         "main.tilua": `counter = 1\nprint(counter)\nprint(typo)\n`,
-        "defs.d.tilua": `declare function print(...: unknown): ()\n`,
+        "defs.d.tilua": `declare function print(...args: unknown[]): nil\n`,
     })
     const withUnknown = await bundle({ entry: join(unknown, "main.tilua"), config: { types: ["./defs.d.tilua"] } })
     check("bundle: a name nothing declares is reported, and still builds",
@@ -887,7 +904,7 @@ function fails(name: string, result: BundleResult, message: string): void {
             "",
         ].join("\n"),
         "main.tilua": `import { Tags } from "./tags"\nprint(Tags(1, 2))\n`,
-        "defs.d.tilua": "declare function print(...: unknown): ()\ndeclare function tostring(value: unknown): string\n",
+        "defs.d.tilua": "declare function print(...args: unknown[]): nil\ndeclare function tostring(value: unknown): string\n",
     })
     runs("bundle: an exported overload set is one function",
         await bundle({ entry: join(root, "main.tilua"), config: { types: ["./defs.d.tilua"] } }), ["12"])
@@ -954,16 +971,56 @@ await lowers("a spread anywhere else builds the list first",
     + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
     + "return result; end; "
     + "f(table.unpack(tilua_concat(xs, { 1 })));")
-await lowers("a `return` spreads the same way a call does",
-    "declare xs: number[]\nfunction f() {\n    return ...xs\n}",
-    "local function f() return table.unpack(xs); end;")
-await lowers("and so does a declaration",
-    "declare xs: number[]\nconst a, b = ...xs",
-    "local a, b = table.unpack(xs);")
+// Several results are an array — a table, returned and taken apart like any.
+await lowers("several results are an array, and a destructuring reads it",
+    [
+        "function two(): [number, string] {",
+        "    return [1, \"a\"]",
+        "}",
+        "const [n, s] = two()",
+        "const both = two()",
+        "",
+        "",
+    ].join("\n"),
+    "local function two() return { 1, \"a\" }; end; local ref = two(); local n, s = ref[1], ref[2]; local both = two();")
+await lowers("a call nothing types is kept to one value in the last place of a list",
+    "declare function typed(): number\nprint(1, untyped())\nprint(typed())\nconst xs = [untyped()]",
+    "print(1, (untyped())); print(typed()); local xs = { (untyped()) };")
+await lowers("`scriptArgs` is the script's own `...`, as an array",
+    "const first = scriptArgs[1]",
+    "local scriptArgs = { ... }; local first = scriptArgs[1];")
 
-await lowers("bare `...` is the pack, not a spread",
-    "function f(...) {\n    g(...)\n}",
-    "local function f(...) g(...); end;")
+// A library puts its own function where a global stands — `pcall` answering
+// `{ success, data, error }` — for a call and for the global read as a value,
+// a member of a global table (`string.find`) included.
+{
+    const plugin: LoweringPlugin = {
+        runtime: { result: "local __NAME__ = {}\nfunction __NAME__.pcall(...) return { ... } end\nfunction __NAME__.find(...) return { ... } end\n" },
+        globalCall: ({ name, use }) => name === "pcall" ? { callee: `${use("result")}.pcall` }
+            : name === "string.find" ? { callee: `${use("result")}.find` }
+            : undefined,
+        globalValue: ({ name, use }) => name === "pcall" ? `${use("result")}.pcall`
+            : name === "string.find" ? `${use("result")}.find`
+            : undefined,
+    }
+    const program = parseTilua([
+        "declare function load(): number",
+        "const result = pcall(load)",
+        "const later = pcall",
+        "const found = string.find(\"abc\", \"b\")",
+        "const finder = string.find",
+        "",
+    ].join("\n"))
+    const scopes = analyzeScopesTilua(program)
+    const result = lower(program, scopes, { types: analyzeTypesTilua(program, scopes, {}), lowerings: [{ plugin, from: "test" }] })
+    const code = flat(printLuau(luau.program(result.statements)))
+    check("globals: a library's own function stands where the global did", [
+        code.includes("local result = tilua_result.pcall(load);"),
+        code.includes("local later = tilua_result.pcall;"),
+        code.includes("local found = tilua_result.find(\"abc\", \"b\");"),
+        code.includes("local finder = tilua_result.find;"),
+    ], [true, true, true, true])
+}
 
 // A rest parameter is Lua's `{...}` under a name: the function still takes
 // `...`, and the array of it is a local.
@@ -976,17 +1033,6 @@ await lowers("a rest parameter is the varargs, named",
         "",
     ].join("\n"),
     "local function join(sep, ...) local parts = { ... }; return parts; end;")
-
-await lowers("an array of the varargs is Lua's own table of them",
-    [
-        "function join(...) {",
-        "    const parts = [...]",
-        "    return parts",
-        "}",
-        "",
-        "",
-    ].join("\n"),
-    "local function join(...) local parts = { ... }; return parts; end;")
 
 // --- classes ----------------------------------------------------------------
 // What a class lowers to is one table per class and one table per instance,
@@ -1046,13 +1092,13 @@ await lowers("an array of the varargs is Lua's own table of them",
             "class Tile extends Square {",
             "}",
             "",
-            "const s = new Square(3)",
+            "const s = Square.new(3)",
             "print(s:describe())",
             "print(s.label, s.sides, s.side)",
             "s.label = \"box\"",
             "print(s:describe())",
             "",
-            "const t = new Tile(2)",
+            "const t = Tile.new(2)",
             "print(t:describe(), t.label)",
             "print(Shape.count(), Square.count(), Square.made)",
             "",
@@ -1092,7 +1138,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "        return this.value",
             "    }",
             "    function map<R>(f: (value: T) => R): Box<R> {",
-            "        return new Box(f(this.value))",
+            "        return Box.new(f(this.value))",
             "    }",
             "}",
             "",
@@ -1108,15 +1154,15 @@ await lowers("an array of the varargs is Lua's own table of them",
             "class Derived extends Base {",
             "}",
             "",
-            "const base = new Base()",
-            "const derived = new Derived()",
+            "const base = Base.new()",
+            "const derived = Derived.new()",
             "print(base.ClassObject == Base, derived.ClassObject == Derived)",
             "print(Derived.ParentClass == Base, Base.ParentClass == nil)",
             "print(derived.ClassObject.ParentClass == Base)",
             "-- The class is one table, shared: nothing of it sits on an instance.",
             "print(rawget(derived, \"ClassObject\") == nil, rawget(derived, \"n\") == 1)",
             "",
-            "const numbers = new Box(41)",
+            "const numbers = Box.new(41)",
             "print(numbers:get() + 1)",
             "print(numbers:map(function(n) { return tostring(n) .. \"!\" }):get())",
             "",
@@ -1128,7 +1174,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "        return this:get() * 2",
             "    }",
             "}",
-            "print(new Ints(21):double())",
+            "print(Ints.new(21):double())",
             "",
             "const Counter = class {",
             "    n = 0",
@@ -1137,7 +1183,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "        return this.n",
             "    }",
             "}",
-            "const counter = new Counter()",
+            "const counter = Counter.new()",
             "counter:bump()",
             "print(counter:bump(), counter.ClassObject == Counter)",
             "",
@@ -1177,7 +1223,7 @@ await lowers("class: the simple case is the plain Lua idiom",
     "local function tilua_class(base) local class = { __getters = {}, __setters = {} }; class.__index = class; "
     + "class.ClassObject = class; class.ParentClass = base; "
     + "if base ~= nil then setmetatable(class, { __index = base }); setmetatable(class.__getters, { __index = base.__getters }); "
-    + "setmetatable(class.__setters, { __index = base.__setters }); end; return class; end; "
+    + "setmetatable(class.__setters, { __index = base.__setters }); for _, key in ipairs({ \"__add\", \"__sub\", \"__mul\", \"__div\", \"__idiv\", \"__mod\", \"__pow\", \"__unm\", \"__concat\", \"__len\", \"__eq\", \"__lt\", \"__le\", \"__call\", \"__tostring\", \"__iter\" }) do class[key] = base[key]; end; end; return class; end; "
     + "local function tilua_accessors(class) "
     + "if not class.__dynamic and next(class.__getters) == nil and next(class.__setters) == nil then return; end; "
     + "class.__dynamic = true; "
@@ -1195,9 +1241,57 @@ await lowers("class: new is a call of the class's own constructor",
     [
         "declare class Vec { x: number }",
         "declare Vec: { new: (x: number) => Vec }",
-        "const v = new Vec(1)",
+        "const v = Vec.new(1)",
     ].join("\n"),
     "local v = Vec.new(1);")
+
+// `abstract` has nothing to lower: no `new` for the abstract class, no
+// function for an abstract method. The class extending it has both.
+{
+    const result = await compile([
+        "abstract class Shape {",
+        "    abstract function area(): number",
+        "    function twice(): number {",
+        "        return this:area() * 2",
+        "    }",
+        "}",
+        "class Unit extends Shape {",
+        "    function area(): number {",
+        "        return 1",
+        "    }",
+        "}",
+        "print(Unit.new():twice())",
+    ].join("\n"))
+    const code = result.code ?? ""
+    check("class: an abstract class has no `new`, and an abstract method no function", [
+        result.diagnostics.length, code.includes("function Shape.new"), code.includes("function Shape.area"),
+        code.includes("function Unit.new"), code.includes("function Unit.area"),
+    ], [0, false, false, true, true])
+}
+
+// A metamethod is an ordinary function on the class table, which is what
+// Luau reads it from.
+{
+    const result = await compile([
+        "class Vec {",
+        "    x: number",
+        "    constructor(x: number) {",
+        "        this.x = x",
+        "    }",
+        "    function __add(other: Vec): Vec {",
+        "        return Vec.new(this.x + other.x)",
+        "    }",
+        "}",
+        "class Named extends Vec {",
+        "}",
+        "print((Named.new(1) + Vec.new(2)).x)",
+    ].join("\n"))
+    check("class: a metamethod is a function on the class, and the helper copies it into a class extending it", [
+        result.diagnostics.length, (result.code ?? "").includes("function Vec.__add(this, other)"),
+        (result.code ?? "").includes("class[key] = base[key]"),
+    ], [0, true, true])
+    if (result.code) validLuau("class: metamethods lower to valid Luau", result.code)
+}
 
 for (const failure of failures) console.log(`FAIL ${failure}`)
 const note = luauBinary ? "" : ` (${skipped} runs skipped: no Luau interpreter; set LUAU to run them)`

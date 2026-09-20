@@ -65,10 +65,14 @@ JavaScript module the build loads.
 | `function f(n = 1, { x })` | `function f(n, arg) if n == nil then n = 1 end local x = arg.x ...` |
 | `const` / `let` | `local` |
 | `class C { … }` | one table for the class, one per instance — see below |
-| `new C(x)` | `C.new(x)` |
-| `[...]` | `{...}` — the varargs as an array |
+| `return [a, b]` | `return { a, b }` — several results are an array |
+| `for (const item in xs)` | `for _, item in xs do … end` — an array or a table walked for its values |
+| `for (const item in step)` | `for item in step do … end` — an iterator function |
+| `for (const [k, v] in pairs(t))` | `for item in unpack(pairs(t), 1, 3) do local k, v = item[1], item[2] … end` — an iteration is `[step, state, first]` |
+| `pcall(f)`, and other globals Luau answers several values from | the type library's own function, answering one — see below |
 | `function f(a, ...rest)` | `function f(a, ...) local rest = {...}` |
-| `f(a, ...xs)` / `return ...xs` | `table.unpack(xs)` in the last position |
+| `scriptArgs` | the chunk's own `...`, as `local scriptArgs = { ... }` |
+| `f(a, ...xs)` | `table.unpack(xs)` in the last position |
 | `f(...xs, a)` | the list built first, then `table.unpack` of it |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
@@ -113,8 +117,16 @@ tilua_accessors(Dog)
 
 `__init` is what `super(...)` calls: it runs the constructor on an instance
 that already exists, so a derived class builds one table, not one per level.
-`new` is a real function on the class table — `new Dog(x)` and `Dog.new(x)`
-are the same call.
+`new` is a real function on the class table, and `Dog.new(x)` is how an
+instance is built — the way Luau builds one. An `abstract class` has no `new`,
+and an `abstract` method no function: both exist only to be checked.
+
+A method named for a metamethod — `__add`, `__tostring`, `__call`, … — is an
+ordinary function on the class table, and since the class table is its
+instances' metatable, it works as one. Luau reads metamethods off the
+metatable with `rawget`, never through its `__index`, so a class would not
+inherit its base's: `tilua_class` copies them into each class that extends
+another, and one the class writes itself replaces the copy.
 
 Two links come with every class, and they cost an instance nothing because
 they live on the class table: `ClassObject`, which an instance reads through

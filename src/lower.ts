@@ -107,6 +107,9 @@ export interface LowerResult {
      *  file it was lowered from, this is what turns a line of the bundle back
      *  into a place someone can open. */
     readonly origins: WeakMap<L.Statement, number>
+    /** The file reads `scriptArgs`: whatever runs it has to set it up, from
+     *  the chunk's own `...` — this file, compiled alone, does it itself. */
+    readonly usesScriptArgs: boolean
 }
 
 /** How a module's exports behave at runtime, beyond what its code assigns. */
@@ -174,14 +177,23 @@ class Lowerer {
         const helpers = this.helperDefinitions()
         // Captured before any of the file's code runs — before its own `table`.
         const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
+        // A file compiled on its own is the chunk: its `...` is what it was
+        // started with. A bundle sets this up once, for every module.
+        const scriptArgs = this.usesScriptArgs && !this.options.module
+            ? [luau.local(["scriptArgs"], [luau.table([{ type: "TableFieldPositional", value: vararg() }])])]
+            : []
         return {
-            statements: [...captured, ...helpers, ...this.classRuntimeStatements(), ...body],
+            statements: [...scriptArgs, ...captured, ...helpers, ...this.classRuntimeStatements(), ...body],
             exportsName: this.exportsName,
             module: this.info,
             diagnostics: this.diagnostics,
             origins: this.origins,
+            usesScriptArgs: this.usesScriptArgs,
         }
     }
+
+    /** Whether the file reads `scriptArgs`, the language's own global. */
+    private usesScriptArgs = false
 
     private report(node: T.BaseNode, message: string): void {
         this.diagnostics.push({ message, line: node.line.start, column: node.column.start })
@@ -323,6 +335,11 @@ class Lowerer {
     /** The name a global is read by at `node`, or `undefined` when `node` is
      *  not a global — a local of the same name is the author's. */
     private globalName(node: T.Expression): string | undefined {
+        // `coroutine.resume`: a member of a global table is named by its path.
+        if (node.type === "MemberExpression" && !node.optional) {
+            const base = this.globalName(node.object)
+            return base === undefined ? undefined : `${base}.${node.property.name}`
+        }
         if (node.type !== "Identifier") return undefined
         const id = this.scopes.bindingOf.get(node)
         if (id === undefined) return node.name
@@ -385,7 +402,7 @@ class Lowerer {
     }
 
     /** What a library says a global read as a value — `local p = print` — is. */
-    private loweredGlobalValue(node: T.Identifier): L.Expression | undefined {
+    private loweredGlobalValue(node: T.Identifier | T.MemberExpression): L.Expression | undefined {
         const lowerings = this.options.lowerings
         if (!lowerings?.some(l => l.plugin.globalValue)) return undefined
         const name = this.globalName(node)
@@ -657,7 +674,7 @@ class Lowerer {
                 }
                 case "ReturnStatement":
                     // An early `return` stops the module; a value has nowhere to go.
-                    if (declaration.arguments.length) this.report(declaration, "A module cannot return a value; export it instead")
+                    if (declaration.argument) this.report(declaration, "A module cannot return a value; export it instead")
                     body.push(luau.returns([]))
                     break
                 case "ImportStatement":
@@ -860,7 +877,7 @@ class Lowerer {
             case "CallStatement": {
                 const chain = optionalChain(node.expression)
                 if (chain) return [this.optionalCallStatement(chain)]
-                const expression = this.expression(node.expression)
+                const expression = this.callValues(node.expression)
                 if (expression.type !== "CallExpression" && expression.type !== "MethodCallExpression") {
                     this.report(node, "A statement must be a call")
                     return []
@@ -924,28 +941,37 @@ class Lowerer {
                 }]
 
             case "GenericForStatement": {
-                // `for _, { a, b } in pairs(t)`: each pattern becomes a loop
-                // variable that the body destructures first.
+                // `for (const [a, b] in pairs(t))`: one value each time, which
+                // a pattern takes apart at the top of the body.
                 const prelude: L.Statement[] = []
-                const variables = node.variables.map(target => {
-                    if (target.type === "IdentifierPattern") return this.name(target.name)
-                    const temp = this.names.fresh("item")
-                    prelude.push(...this.destructure(target, luau.identifier(temp), "declare"))
-                    return temp
-                })
-                // `for x in list` yields the values in tilua; Luau yields the
-                // keys first. Which loops those are is the type analysis's
-                // call — it binds the variable's type from the same choice, so
-                // asking it is what keeps the name and its type in step.
-                if (variables.length === 1 && this.options.types?.iteratesValues.has(node)) {
-                    variables.unshift(this.names.fresh("_"))
+                let item: string
+                if (node.variable.type === "IdentifierPattern") {
+                    item = this.name(node.variable.name)
+                } else {
+                    item = this.names.fresh("item")
+                    prelude.push(...this.destructure(node.variable, luau.identifier(item), "declare"))
                 }
-                return [luau.genericFor(variables, node.iterators.map(e => this.expression(e)),
+                // How the source is walked is the type analysis's call — it
+                // binds the item's type from the same choice, so the name and
+                // its type cannot drift apart.
+                const form = this.options.types?.loops.get(node) ?? { walks: "values" as const, viaIter: false }
+                let source = this.expression(node.iterator)
+                // An object that says how to walk itself hands over its
+                // iterator, or its iteration, from `__iter`.
+                if (form.viaIter) source = luau.methodCall(source, "__iter", [])
+                const variables = form.walks === "values" ? [this.names.fresh("_"), item] : [item]
+                // An iteration is `[step, state, first]`: the three Luau loops
+                // with, taken out of the array they are.
+                const iterators = form.walks === "iteration"
+                    ? [luau.call(this.builtin("unpack"), [source, luau.number(1), luau.number(3)])]
+                    : [source]
+                return [luau.genericFor(variables, iterators,
                     this.loopBody51(this.block(node.body, prelude)).statements)]
             }
 
             case "ReturnStatement":
-                return [luau.returns(this.values(node.arguments))]
+                // One value — several are an array, and that is a table.
+                return [luau.returns(node.argument ? [this.expression(node.argument)] : [])]
 
             case "BreakStatement":
                 return [{ type: "BreakStatement", ...spanOf(node) }]
@@ -1001,7 +1027,7 @@ class Lowerer {
     //     end
     //     function Dog.speak(this) ... end
     //
-    // `new Dog(x)` is `Dog.new(x)`, `dog:speak()` passes the instance
+    // `Dog.new(x)` builds one, `dog:speak()` passes the instance
     // as `this`, and `super.speak()` is `Animal.speak(this)` — the
     // base's own function, run on this instance.
     // ============================================================
@@ -1030,6 +1056,12 @@ class Lowerer {
     private classRuntimeStatements(): L.Statement[] {
         if (!this.classHelpers) return []
         const { build, accessors } = this.classHelpers
+        // Luau finds a metamethod with `rawget` on the metatable — the class
+        // table — never through its `__index`. So what a class inherits
+        // through `__index` it does not inherit as an operator: the base's
+        // are copied in when the class is made, and one the class writes
+        // itself then replaces the copy.
+        const metamethods = `{ ${CLASS_METAMETHODS.map(name => `"${name}"`).join(", ")} }`
         return parseLuau(`
 local function ${build}(base)
     local class = { __getters = {}, __setters = {} }
@@ -1040,6 +1072,9 @@ local function ${build}(base)
         setmetatable(class, { __index = base })
         setmetatable(class.__getters, { __index = base.__getters })
         setmetatable(class.__setters, { __index = base.__setters })
+        for _, key in ipairs(${metamethods}) do
+            class[key] = base[key]
+        end
     end
     return class
 end
@@ -1110,6 +1145,8 @@ end
                         }
                         break
                     case "ClassMethod":
+                        // An abstract method is a promise, not a function.
+                        if (member.isAbstract) break
                         out.push(this.functionStatement(luau.member(self, member.name.name), member,
                             this.classFunctionBody(member.func), false))
                         break
@@ -1124,7 +1161,9 @@ end
                 }
             }
             out.push(this.classInit(node, self))
-            out.push(this.classNew(node, self))
+            // An abstract class is only ever built as part of one extending it,
+            // through its `__init`; it has no `new` of its own.
+            if (!node.isAbstract) out.push(this.classNew(node, self))
             out.push(luau.callStatement(luau.call(luau.identifier(accessors), [self])))
         } finally {
             this.classContext = previous
@@ -1455,12 +1494,16 @@ end
             }
         }
         switch (node.type) {
-            case "Identifier": return this.loweredGlobalValue(node) ?? this.reference(node)
+            case "Identifier":
+                if (node.name === "scriptArgs" && this.isLanguageGlobal(node)) {
+                    this.usesScriptArgs = true
+                    return luau.identifier("scriptArgs")
+                }
+                return this.loweredGlobalValue(node) ?? this.reference(node)
             case "NilLiteral": return luau.nil()
             case "BooleanLiteral": return luau.boolean(node.value)
             case "NumberLiteral": return luau.number(node.value, this.numberRaw(node))
             case "StringLiteral": return luau.string(node.value)
-            case "VarargExpression": return vararg()
             // Only a recovering parse makes one, and a syntax error stops the build.
             case "ErrorExpression":
                 this.report(node, "Syntax error")
@@ -1484,11 +1527,6 @@ end
             case "UnaryExpression":
                 return luau.unary(node.operator, this.expression(node.argument))
 
-            case "NewExpression":
-                // `new Name(args)` is the class's own `Name.new(args)`.
-                return luau.call(luau.member(this.expression(node.callee), "new"),
-                    this.values(node.arguments))
-
             case "SuperExpression":
                 return this.superClassReference(node)
 
@@ -1501,20 +1539,19 @@ end
             case "ClassExpression":
                 return this.classExpression(node)
 
-            case "MemberExpression":
-            case "IndexExpression":
             case "CallExpression":
-            case "MethodCallExpression": {
+            case "MethodCallExpression":
+                return this.callValues(node)
+
+            case "MemberExpression":
+            case "IndexExpression": {
                 const chain = optionalChain(node)
                 if (chain) return this.optionalChainExpression(chain)
-                // A name that is called is not read as a value: `print(x)` is
-                // `globalCall`'s to answer, and asking `globalValue` about the
-                // `print` in it would emit a runtime nothing then uses.
-                const object = linkObject(node)
-                if (node.type === "CallExpression" && object.type === "Identifier") {
-                    return this.link(node, this.reference(object))
-                }
-                return this.link(node, this.expression(object))
+                // `string.find` read as a value is whatever the library says
+                // `string.find` is — the same function its calls get.
+                const global = node.type === "MemberExpression" ? this.loweredGlobalValue(node) : undefined
+                if (global) return global
+                return this.link(node, this.expression(linkObject(node)))
             }
 
             case "ParenthesizedExpression":
@@ -1537,14 +1574,53 @@ end
         }
     }
 
+    /** A call. */
+    private callValues(node: T.CallExpression | T.MethodCallExpression): L.Expression {
+        const chain = optionalChain(node)
+        if (chain) return this.optionalChainExpression(chain)
+        // A name that is called is not read as a value: `print(x)` is
+        // `globalCall`'s to answer, and asking `globalValue` about the
+        // `print` in it would emit a runtime nothing then uses.
+        const object = linkObject(node)
+        if (node.type === "CallExpression" && object.type === "Identifier") {
+            return this.link(node, this.reference(object))
+        }
+        return this.link(node, this.expression(object))
+    }
+
+    /** A call is one value in tilua, and Luau would hand on every value one
+     *  in the last place of an argument list or an array returns. Types say
+     *  how many a call returns; where a type says nothing — `any`, `unknown`
+     *  — the call is kept to one: `f((g()))`. */
+    private keptToOne(nodes: readonly T.Expression[], values: L.Expression[]): L.Expression[] {
+        const node = nodes[nodes.length - 1]
+        const last = values[values.length - 1]
+        if (!node || !last || !expandsToMany(last)) return values
+        const type = this.options.types?.typeOf.get(node)
+        if (type && type.kind !== "any" && type.kind !== "unknown") return values
+        return [...values.slice(0, -1), luau.parenthesized(last)]
+    }
+
+    /** Is this `scriptArgs` the language's own, not a name the file declared? */
+    private isLanguageGlobal(node: T.Identifier): boolean {
+        const id = this.bindingIdOf(node)
+        return id === undefined || this.scopes.bindings.get(id)?.kind === "global"
+    }
+
     /** A list of values — a call's arguments, a `return`'s, a declaration's,
      *  an assignment's. `f(a, ...xs)` is Lua's own last-value expansion,
      *  `f(a, table.unpack(xs))`; a spread anywhere else cannot be, since only
      *  the last value of a list expands, so the whole list is built as an
-     *  array first and that is what expands. */
-    private values(list: readonly T.Expression[]): L.Expression[] {
+     *  array first and that is what expands.
+     *
+     *  `arguments` is set for a call's arguments, where Luau hands on every
+     *  value the last one returns — see `keptToOne`. */
+    private values(list: readonly T.Expression[], asArguments = false): L.Expression[] {
         const spreads = list.filter(a => a.type === "SpreadElement")
-        if (!spreads.length) return list.map(a => this.expression(a))
+        if (!spreads.length) {
+            const lowered = list.map(a => this.expression(a))
+            return asArguments ? this.keptToOne(list, lowered) : lowered
+        }
         const unpack = (value: L.Expression): L.Expression =>
             luau.call(luau.member(this.builtin("table"), "unpack"), [value])
         const last = list[list.length - 1]
@@ -1565,13 +1641,13 @@ end
                 return luau.index(object, this.expression(node.index))
             case "CallExpression": {
                 const lowered = this.loweredGlobalCall(node)
-                const args = this.values(node.arguments)
-                if (lowered) return luau.call(calleePath(lowered.callee), [...lowered.prepend, ...args])
-                return luau.call(object, args)
+                const args = this.values(node.arguments, true)
+                if (!lowered) return luau.call(object, args)
+                return luau.call(calleePath(lowered.callee), [...lowered.prepend, ...args])
             }
             case "MethodCallExpression": {
                 const lowered = this.loweredMethodCall(node)
-                const args = this.values(node.arguments)
+                const args = this.values(node.arguments, true)
                 if (lowered) {
                     return luau.call(calleePath(lowered.callee), [
                         ...lowered.prepend,
@@ -1832,7 +1908,9 @@ end
      *  runs of plain elements and the spread arrays are joined by `concat`. */
     private arrayExpression(node: T.ArrayExpression): L.Expression {
         if (!node.elements.some(e => e.type === "SpreadElement")) {
-            return luau.table(node.elements.map(e => ({ type: "TableFieldPositional", value: this.expression(e as T.Expression) })))
+            const elements = node.elements as T.Expression[]
+            return luau.table(this.keptToOne(elements, elements.map(e => this.expression(e)))
+                .map(value => ({ type: "TableFieldPositional", value })))
         }
         const parts: L.Expression[] = []
         let current: T.Expression[] = []
@@ -1920,6 +1998,7 @@ function vararg(): L.VarargExpression {
 function selectCount(select: L.Expression): L.Expression {
     return luau.call(select, [luau.string("#"), vararg()])
 }
+
 
 function expandsToMany(e: L.Expression): boolean {
     return e.type === "CallExpression" || e.type === "MethodCallExpression" || e.type === "VarargExpression"
@@ -2104,3 +2183,9 @@ function allNodes(root: unknown): object[] {
     visit(root)
     return out
 }
+
+/** The metamethods a class can write, copied from the class it extends. */
+const CLASS_METAMETHODS = [
+    "__add", "__sub", "__mul", "__div", "__idiv", "__mod", "__pow", "__unm", "__concat",
+    "__len", "__eq", "__lt", "__le", "__call", "__tostring", "__iter",
+]
