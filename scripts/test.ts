@@ -111,7 +111,7 @@ function refuses51(name: string, source: string, reason: string): void {
 }
 
 // --- declarations ---------------------------------------------------------------
-await lowers("const and let are local", "const a = 1\nlet b, c = 2, 3", "local a = 1; local b, c = 2, 3;")
+await lowers("const and let are local", "const a = 1\nlet b = 2", "local a = 1; local b = 2;")
 await lowers("a declaration without a value", "let x", "local x;")
 await lowers("types are dropped", "type P = { x: number }\ndeclare game: unknown\nconst n: number = 1 as number", "local n = 1;")
 await lowers("satisfies and as const are dropped", "const t = { a: 1 } satisfies { a: number }\nconst u = [1] as const", "local t = { a = 1 }; local u = { 1 };")
@@ -177,8 +177,8 @@ await lowers("a computed key is evaluated first",
 await lowers("rest takes the other keys",
     "const { a, ...others } = value",
     `local a = value.a; local others = {}; for key, value2 in pairs(value) do if key ~= "a" then others[key] = value2; end; end;`)
-await lowers("destructuring beside plain names",
-    "const x, { y } = f()", "local x, ref = f(); local y = ref.y;")
+await lowers("destructuring what a call returns reads it once",
+    "const { y } = f()", "local ref = f(); local y = ref.y;")
 
 // --- array destructuring ---------------------------------------------------------
 await lowers("arrays read by index", "const [first, second] = list", "local first, second = list[1], list[2];")
@@ -186,9 +186,9 @@ await lowers("holes are skipped", "const [, second] = list", "local second = lis
 await lowers("array rest", "const [head, ...tail] = list", "local head = list[1]; local tail = table.move(list, 2, #list, 1, {});")
 
 // --- destructuring assignment ----------------------------------------------------
-await lowers("assigns straight from a name", "let a, b = 1, 2\n{ a, b } = value", "local a, b = 1, 2; a, b = value.a, value.b;")
+await lowers("assigns straight from a name", "let a = 1\nlet b = 2\n{ a, b } = value", "local a = 1; local b = 2; a, b = value.a, value.b;")
 await lowers("assignment from anything else is scoped",
-    "let a, b = 1, 2\n{ a, b } = { a: b, b: a }", "local a, b = 1, 2; do local ref = { a = b, b = a }; a, b = ref.a, ref.b; end;")
+    "let a = 1\nlet b = 2\n{ a, b } = { a: b, b: a }", "local a = 1; local b = 2; do local ref = { a = b, b = a }; a, b = ref.a, ref.b; end;")
 
 // --- tables, arrays and strings --------------------------------------------------
 await lowers("object literals", `const t = { a: 1, "b-c": 2, [k]: 3, d }`, `local t = { a = 1, ["b-c"] = 2, [k] = 3, d = d };`)
@@ -198,16 +198,16 @@ await lowers("object spread copies in order",
     `local function tilua_assign(target, ...) for i = 1, select("#", ...) do local source = select(i, ...); if source ~= nil then for key, value in pairs(source) do target[key] = value; end; end; end; return target; end; local t = tilua_assign({}, { a = 1 }, base, { b = 2 });`)
 await lowers("array spread joins the runs",
     "const xs = [f(), ...ys, g()]",
-    `local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { (g()) });`)
+    `local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { g() });`)
 // Luau only calls a method on a string in parentheses; tilua lets it go bare.
 await lowers("a method call on a bare string gets its parentheses",
     `const a = "a":upper():rep(2)
 print("b":lower())`, `local a = ("a"):upper():rep(2); print((("b"):lower()));`)
 await lowers("a method call on a bare template string", "print(`${a}!`:upper())",
     `print((("%s!"):format(tostring(a)):upper()));`)
-await lowers("interpolation becomes format", "print(`${a} any`)", `print(("%s any"):format(tostring(a)));`)
+await lowers("interpolation becomes format", "print(`${a} any`)", `print((("%s any"):format(tostring(a))));`)
 await lowers("interpolation escapes percent signs and keeps braces",
-    "print(`${n}% of {total}`)", `print(("%s%% of {total}"):format(tostring(n)));`)
+    "print(`${n}% of {total}`)", `print((("%s%% of {total}"):format(tostring(n))));`)
 await lowers("a template without interpolation is a string", "print(`plain`)", `print("plain");`)
 
 // --- functions -------------------------------------------------------------------
@@ -240,7 +240,7 @@ await lowers("an iteration is the three Luau loops with, taken out of the array 
 await lowers("attributes are kept", "@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
 await lowers("a shadowed global the output needs is captured first",
     "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
-    `local tilua_table = table; local table = {}; local a = list[1]; local rest = tilua_table.move(list, 2, #list, 1, {}); print(("%s"):format(tostring(a)));`)
+    `local tilua_table = table; local table = {}; local a = list[1]; local rest = tilua_table.move(list, 2, #list, 1, {}); print((("%s"):format(tostring(a))));`)
 
 check("a parse error leaves no output",
     ((r: { code?: string; diagnostics: unknown[] }) => [r.code, r.diagnostics.length > 0])(await compile("const = 1")), [undefined, true])
@@ -408,7 +408,7 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
     const resolved = [...map].sort((a, b) => a[0] - b[0])
         .map(([line, origin]) => `${(lines[line - 1] ?? "").trim()} -> ${origin}`)
     check("line map: each bundled line points back at the source that wrote it", resolved, [
-        "print(util.twice(start)); -> src/main.tilua:3",
+        "print((util.twice(start))); -> src/main.tilua:3",
         "function exports.twice(n) -> src/util.tilua:1",
         "local doubled = n * 2; -> src/util.tilua:2",
         "return doubled; -> src/util.tilua:3",
@@ -644,7 +644,8 @@ function fails(name: string, result: BundleResult, message: string): void {
             `const stack = Stack.new()`,
             `stack:push(5)`,
             `const label = if total > 10 then "big" else "small"`,
-            `let a, b = 1, 2`,
+            `let a = 1`,
+            `let b = 2`,
             `{ a, b } = { a: b, b: a }`,
             `print(\`\${x} \${py} \${count} \${first} \${third} \${#tail} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...scriptArgs)`,
         ].join("\n"),
@@ -987,9 +988,12 @@ await lowers("several results are an array, and a destructuring reads it",
         "",
     ].join("\n"),
     "local function two() return { 1, \"a\" }; end; local ref = two(); local n, s = ref[1], ref[2]; local both = two();")
-await lowers("a call nothing types is kept to one value in the last place of a list",
-    "declare function typed(): number\nprint(1, untyped())\nprint(typed())\nconst xs = [untyped()]",
-    "print(1, (untyped())); print(typed()); local xs = { (untyped()) };")
+// A call is one value: kept to one as an argument and in a `return`, typed
+// or not. An array's last element takes every value — `[require(m)]` is how
+// a program asks for them.
+await lowers("a call is one value, and an array asks for all of them",
+    "declare function typed(): number\nprint(1, untyped())\nprint(typed())\nfunction f() {\n    return untyped()\n}\nconst xs = [untyped()]",
+    "print(1, (untyped())); print((typed())); local function f() return (untyped()); end; local xs = { untyped() };")
 await lowers("`scriptArgs` is the script's own `...`, as an array",
     "const first = scriptArgs[1]",
     "local scriptArgs = { ... }; local first = scriptArgs[1];")

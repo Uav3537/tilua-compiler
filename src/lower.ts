@@ -274,12 +274,10 @@ class Lowerer {
             for (const node of allNodes(this.source.body)) {
                 const statement = node as T.Statement
                 if (statement.type === "VariableDeclaration") {
-                    statement.names.forEach((target, index) => {
-                        const value = statement.init[index]
-                        if (target.type !== "IdentifierPattern" || !value) return
-                        const binding = this.bindingByDeclaration.get(target)
-                        if (binding) this.declarations!.set(binding.id, value)
-                    })
+                    const target = statement.name
+                    if (target.type !== "IdentifierPattern" || !statement.init) continue
+                    const binding = this.bindingByDeclaration.get(target)
+                    if (binding) this.declarations.set(binding.id, statement.init)
                 } else if (statement.type === "FunctionDeclaration") {
                     const binding = this.bindingByDeclaration.get(statement.name)
                     if (binding) this.declarations!.set(binding.id, statement)
@@ -589,7 +587,7 @@ class Lowerer {
                     const declaration = statement.declaration
                     if (declaration.type === "FunctionDeclaration" || declaration.type === "ClassDeclaration") {
                         exportBinding(declaration.name, declaration.name.name)
-                    } else for (const pattern of declaration.names.flatMap(identifierPatterns)) exportBinding(pattern, pattern.name)
+                    } else for (const pattern of identifierPatterns(declaration.name)) exportBinding(pattern, pattern.name)
                     break
                 }
                 case "ExportDefaultStatement":
@@ -629,7 +627,7 @@ class Lowerer {
         for (const statement of statements) {
             const declaration = statement.type === "ExportStatement" ? statement.declaration : statement
             if (declaration.type === "VariableDeclaration") {
-                for (const pattern of declaration.names.flatMap(identifierPatterns)) {
+                for (const pattern of identifierPatterns(declaration.name)) {
                     if (!this.isRewritten(pattern)) locals.push(this.name(pattern.name))
                 }
             } else if ((declaration.type === "FunctionDeclaration" || declaration.type === "ClassDeclaration") &&
@@ -744,7 +742,7 @@ class Lowerer {
                 continue
             }
             if (statement.type !== "VariableDeclaration") continue
-            const patterns = statement.names.flatMap(identifierPatterns)
+            const patterns = identifierPatterns(statement.name)
             // A read from inside the statement's own value counts: it runs
             // later, when the name is there.
             const end = { line: { start: statement.line.end }, column: { start: statement.column.end } } as T.BaseNode
@@ -789,7 +787,7 @@ class Lowerer {
         const body: L.Statement[] = []
         for (const statement of statements) {
             if (statement.type === "VariableDeclaration") {
-                for (const pattern of statement.names.flatMap(identifierPatterns)) locals.push(this.name(pattern.name))
+                for (const pattern of identifierPatterns(statement.name)) locals.push(this.name(pattern.name))
                 body.push(...this.variableDeclaration(statement, "assign"))
             } else if (statement.type === "FunctionDeclaration") {
                 locals.push(this.name(statement.name.name))
@@ -971,7 +969,7 @@ class Lowerer {
 
             case "ReturnStatement":
                 // One value — several are an array, and that is a table.
-                return [luau.returns(node.argument ? [this.expression(node.argument)] : [])]
+                return [luau.returns(node.argument ? [this.keptToOne(this.expression(node.argument))] : [])]
 
             case "BreakStatement":
                 return [{ type: "BreakStatement", ...spanOf(node) }]
@@ -1263,72 +1261,45 @@ end
         }
     }
 
-    /** `const a, { b } = x, y`. In "assign" mode — a module's top level, where
-     *  every name is declared up front — nothing is declared, only assigned. */
+    /** `const a = x`, `const { a, b } = x`. In "assign" mode — a module's top
+     *  level, where every name is declared up front — nothing is declared,
+     *  only assigned. */
     private variableDeclaration(node: T.VariableDeclaration, mode: Mode): L.Statement[] {
-        if (mode === "assign" && !node.init.length) {
+        const target = node.name
+        if (!node.init) {
+            const names = identifierPatterns(target)
+            if (mode === "declare") return [luau.local(names.map(p => this.name(p.name)), [])]
             // `export let x`: the export exists from here on, holding nil.
-            const exported = node.names.flatMap(identifierPatterns).filter(p => this.isRewritten(p))
+            const exported = names.filter(p => this.isRewritten(p))
             return exported.length ? [luau.assign(exported.map(p => this.reference(p)), exported.map(() => luau.nil()))] : []
         }
-        const init = this.values(node.init)
-        if (node.names.every(n => n.type === "IdentifierPattern")) {
-            const names = node.names as T.IdentifierPattern[]
+        const value = this.expression(node.init)
+        if (target.type === "IdentifierPattern") {
             return mode === "declare"
-                ? [luau.local(names.map(n => this.name(n.name)), init)]
-                : [luau.assign(names.map(n => this.reference(n)), init)]
+                ? [luau.local([this.name(target.name)], [value])]
+                : [luau.assign([this.reference(target)], [value])]
         }
         // `const { a, b } = value` reads straight from `value` when it is a plain
         // name; anything else is evaluated once, into a local.
-        const only = node.names.length === 1 && node.init.length === 1 ? node.names[0] : undefined
-        if (only && only.type !== "IdentifierPattern") {
-            if (init[0].type === "Identifier") return this.destructure(only, init[0], mode)
-            const temp = this.names.fresh("ref")
-            return [luau.local([temp], init), ...this.destructure(only, luau.identifier(temp), mode)]
-        }
-        const after: L.Statement[] = []
-        const names: string[] = []
-        const targets: L.Expression[] = []
-        for (const target of node.names) {
-            if (target.type === "IdentifierPattern") {
-                names.push(this.name(target.name))
-                targets.push(this.reference(target))
-                continue
-            }
-            const temp = this.names.fresh("ref")
-            names.push(temp)
-            targets.push(luau.identifier(temp))
-            after.push(...this.destructure(target, luau.identifier(temp), mode))
-        }
-        if (mode === "declare") return [luau.local(names, init), ...after]
-        // Assigning: the temporaries still need declaring.
-        const temps = node.names.flatMap((t, i) => (t.type === "IdentifierPattern" ? [] : [names[i]]))
-        return [...(temps.length ? [luau.local(temps, [])] : []), luau.assign(targets, init), ...after]
+        if (value.type === "Identifier") return this.destructure(target, value, mode)
+        const temp = this.names.fresh("ref")
+        return [luau.local([temp], [value]), ...this.destructure(target, luau.identifier(temp), mode)]
     }
 
     private assignment(node: T.AssignmentStatement): L.Statement[] {
-        if (node.targets.every(t => t.type !== "ObjectPattern" && t.type !== "ArrayPattern")) {
-            return [luau.assign(node.targets.map(t => this.expression(t as T.Expression)), this.values(node.values))]
+        const target = node.target
+        const value = this.expression(node.value)
+        if (target.type !== "ObjectPattern" && target.type !== "ArrayPattern") {
+            return [luau.assign([this.expression(target)], [value])]
         }
-        const values = this.values(node.values)
-        const only = node.targets.length === 1 && values.length === 1 ? node.targets[0] : undefined
-        if (only && (only.type === "ObjectPattern" || only.type === "ArrayPattern") && values[0].type === "Identifier") {
-            const statements = this.destructure(only, values[0], "assign")
+        if (value.type === "Identifier") {
+            const statements = this.destructure(target, value, "assign")
             return statements.some(s => s.type === "LocalStatement") ? [luau.doBlock(statements)] : statements
         }
-        // Every value is read first, as in `a, b = b, a`, then each target
-        // takes its own.
-        const temps = node.targets.map(() => this.names.fresh("ref"))
-        const body: L.Statement[] = [luau.local(temps, values)]
-        node.targets.forEach((target, i) => {
-            const value = luau.identifier(temps[i])
-            if (target.type === "ObjectPattern" || target.type === "ArrayPattern") {
-                body.push(...this.destructure(target, value, "assign"))
-            } else {
-                body.push(luau.assign([this.expression(target)], [value]))
-            }
-        })
-        return [luau.doBlock(body)]
+        // The value is read once, into a local, before any target takes its
+        // part: `[a, b] = [b, a]` swaps.
+        const temp = this.names.fresh("ref")
+        return [luau.doBlock([luau.local([temp], [value]), ...this.destructure(target, luau.identifier(temp), "assign")])]
     }
 
     // --------------------------------------------------------
@@ -1489,7 +1460,7 @@ end
             if (through !== undefined) {
                 return luau.call(luau.member(this.superClassReference(node), through), [
                     luau.identifier(this.thisName()),
-                    ...this.values(node.arguments),
+                    ...this.arguments(node.arguments),
                 ])
             }
         }
@@ -1589,16 +1560,11 @@ end
     }
 
     /** A call is one value in tilua, and Luau would hand on every value one
-     *  in the last place of an argument list or an array returns. Types say
-     *  how many a call returns; where a type says nothing — `any`, `unknown`
-     *  — the call is kept to one: `f((g()))`. */
-    private keptToOne(nodes: readonly T.Expression[], values: L.Expression[]): L.Expression[] {
-        const node = nodes[nodes.length - 1]
-        const last = values[values.length - 1]
-        if (!node || !last || !expandsToMany(last)) return values
-        const type = this.options.types?.typeOf.get(node)
-        if (type && type.kind !== "any" && type.kind !== "unknown") return values
-        return [...values.slice(0, -1), luau.parenthesized(last)]
+     *  returns in the last place of an argument list or a `return`: it is
+     *  kept to one there, `f((g()))`. Every value is taken only where the
+     *  program asks for them, as an array's last element: `[g()]`. */
+    private keptToOne(value: L.Expression): L.Expression {
+        return expandsToMany(value) ? luau.parenthesized(value) : value
     }
 
     /** Is this `scriptArgs` the language's own, not a name the file declared? */
@@ -1607,19 +1573,16 @@ end
         return id === undefined || this.scopes.bindings.get(id)?.kind === "global"
     }
 
-    /** A list of values — a call's arguments, a `return`'s, a declaration's,
-     *  an assignment's. `f(a, ...xs)` is Lua's own last-value expansion,
+    /** A call's arguments. `f(a, ...xs)` is Lua's own last-value expansion,
      *  `f(a, table.unpack(xs))`; a spread anywhere else cannot be, since only
      *  the last value of a list expands, so the whole list is built as an
-     *  array first and that is what expands.
-     *
-     *  `arguments` is set for a call's arguments, where Luau hands on every
-     *  value the last one returns — see `keptToOne`. */
-    private values(list: readonly T.Expression[], asArguments = false): L.Expression[] {
+     *  array first and that is what expands. A call written last is one
+     *  value — see `keptToOne`. */
+    private arguments(list: readonly T.Expression[]): L.Expression[] {
         const spreads = list.filter(a => a.type === "SpreadElement")
         if (!spreads.length) {
             const lowered = list.map(a => this.expression(a))
-            return asArguments ? this.keptToOne(list, lowered) : lowered
+            return lowered.length ? [...lowered.slice(0, -1), this.keptToOne(lowered[lowered.length - 1])] : lowered
         }
         const unpack = (value: L.Expression): L.Expression =>
             luau.call(luau.member(this.builtin("table"), "unpack"), [value])
@@ -1641,13 +1604,13 @@ end
                 return luau.index(object, this.expression(node.index))
             case "CallExpression": {
                 const lowered = this.loweredGlobalCall(node)
-                const args = this.values(node.arguments, true)
+                const args = this.arguments(node.arguments)
                 if (!lowered) return luau.call(object, args)
                 return luau.call(calleePath(lowered.callee), [...lowered.prepend, ...args])
             }
             case "MethodCallExpression": {
                 const lowered = this.loweredMethodCall(node)
-                const args = this.values(node.arguments, true)
+                const args = this.arguments(node.arguments)
                 if (lowered) {
                     return luau.call(calleePath(lowered.callee), [
                         ...lowered.prepend,
@@ -1907,33 +1870,33 @@ end
     /** `[1, ...xs, 2]`. Without a spread it is a Luau sequence; with one, the
      *  runs of plain elements and the spread arrays are joined by `concat`. */
     private arrayExpression(node: T.ArrayExpression): L.Expression {
+        // A call written last takes every value it returns: `[require(m)]`
+        // is how a program asks for all of them. A Luau sequence does that
+        // itself for its last element.
         if (!node.elements.some(e => e.type === "SpreadElement")) {
-            const elements = node.elements as T.Expression[]
-            return luau.table(this.keptToOne(elements, elements.map(e => this.expression(e)))
-                .map(value => ({ type: "TableFieldPositional", value })))
+            return luau.table(node.elements.map(e => ({ type: "TableFieldPositional", value: this.expression(e as T.Expression) })))
         }
         const parts: L.Expression[] = []
         let current: T.Expression[] = []
-        const flush = (): void => {
+        const flush = (last: boolean): void => {
             if (!current.length) return
-            // Only a sequence's last value expands to several; inside a run
-            // that is not last in the array, keep a call to one value.
+            // Only a sequence's last value expands to several; in a run that
+            // a spread follows, a call is kept to one value.
             parts.push(luau.table(current.map((e, i) => {
                 const value = this.expression(e)
-                const last = i === current.length - 1
-                return { type: "TableFieldPositional", value: last && expandsToMany(value) ? luau.parenthesized(value) : value }
+                return { type: "TableFieldPositional", value: last || i < current.length - 1 ? value : this.keptToOne(value) }
             })))
             current = []
         }
         for (const element of node.elements) {
             if (element.type === "SpreadElement") {
-                flush()
+                flush(false)
                 parts.push(this.expression(element.argument))
             } else {
                 current.push(element)
             }
         }
-        flush()
+        flush(true)
         return luau.call(this.helper("concat"), parts)
     }
 }
@@ -2044,7 +2007,7 @@ function topLevelDeclaration(
     for (const statement of statements) {
         const declaration = statement.type === "ExportStatement" ? statement.declaration : statement
         if (declaration.type === "VariableDeclaration") {
-            const pattern = declaration.names.flatMap(identifierPatterns).find(p => p.name === name)
+            const pattern = identifierPatterns(declaration.name).find(p => p.name === name)
             if (pattern) return { type: "Declaration", node: pattern }
         } else if (declaration.type === "FunctionDeclaration" && declaration.name.name === name) {
             return { type: "Declaration", node: declaration.name }
