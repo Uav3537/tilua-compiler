@@ -189,6 +189,9 @@ await lowers("array rest", "const [head, ...tail] = list", "local head = list[1]
 await lowers("assigns straight from a name", "let a = 1\nlet b = 2\n{ a, b } = value", "local a = 1; local b = 2; a, b = value.a, value.b;")
 await lowers("assignment from anything else is scoped",
     "let a = 1\nlet b = 2\n{ a, b } = { a: b, b: a }", "local a = 1; local b = 2; do local ref = { a = b, b = a }; a, b = ref.a, ref.b; end;")
+await lowers("an assignment's pattern takes indexes and members",
+    "const t = [1, 2]\nconst o = { a: 0 }\nlet i = 1\nlet j = 2\n[t[i], t[j]] = [t[j], t[i]]\n{ a: o.a } = { a: 3 }",
+    "local t = { 1, 2 }; local o = { a = 0 }; local i = 1; local j = 2; do local ref = { t[j], t[i] }; t[i], t[j] = ref[1], ref[2]; end; do local ref2 = { a = 3 }; o.a = ref2.a; end;")
 
 // --- tables, arrays and strings --------------------------------------------------
 await lowers("object literals", `const t = { a: 1, "b-c": 2, [k]: 3, d }`, `local t = { a = 1, ["b-c"] = 2, [k] = 3, d = d };`)
@@ -976,6 +979,22 @@ await lowers("a spread anywhere else builds the list first",
     + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
     + "return result; end; "
     + "f(table.unpack(tilua_concat(xs, { 1 })));")
+// `...[a, b]` is the Luau pack `a, b`, written out rather than unpacked.
+await lowers("a spread array literal is its values",
+    "f(...[1, 2])\nf(0, ...[1, ...[2, 3]], 4)",
+    "f(1, 2); f(0, 1, 2, 3, 4);")
+await lowers("a spread literal's last call keeps every value when it ends the list",
+    "f(...[1, g()])\nf(g(), 1)",
+    "f(1, g()); f(g(), 1);")
+await lowers("a spread literal's last call anywhere else stays an array",
+    "f(...[1, g()], 2)",
+    "local function tilua_concat(...) local result = {}; "
+    + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
+    + "return result; end; "
+    + "f(table.unpack(tilua_concat({ 1 }, { g() }, { 2 })));")
+await lowers("a spread array literal in an array is its values",
+    "const xs = [0, ...[1, 2], 3]",
+    "local xs = { 0, 1, 2, 3 };")
 // Several results are an array — a table, returned and taken apart like any.
 await lowers("several results are an array, and a destructuring reads it",
     [

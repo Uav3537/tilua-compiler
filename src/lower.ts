@@ -942,12 +942,13 @@ class Lowerer {
                 // `for (const [a, b] in pairs(t))`: one value each time, which
                 // a pattern takes apart at the top of the body.
                 const prelude: L.Statement[] = []
+                const variable = declared(node.variable)
                 let item: string
-                if (node.variable.type === "IdentifierPattern") {
-                    item = this.name(node.variable.name)
+                if (variable.type === "IdentifierPattern") {
+                    item = this.name(variable.name)
                 } else {
                     item = this.names.fresh("item")
-                    prelude.push(...this.destructure(node.variable, luau.identifier(item), "declare"))
+                    prelude.push(...this.destructure(variable, luau.identifier(item), "declare"))
                 }
                 // How the source is walked is the type analysis's call — it
                 // binds the item's type from the same choice, so the name and
@@ -1265,7 +1266,7 @@ end
      *  level, where every name is declared up front — nothing is declared,
      *  only assigned. */
     private variableDeclaration(node: T.VariableDeclaration, mode: Mode): L.Statement[] {
-        const target = node.name
+        const target = declared(node.name)
         if (!node.init) {
             const names = identifierPatterns(target)
             if (mode === "declare") return [luau.local(names.map(p => this.name(p.name)), [])]
@@ -1319,6 +1320,13 @@ end
         const after: L.Statement[] = []
 
         const bind = (target: T.BindingTarget, value: L.Expression, fallback: T.Expression | undefined): void => {
+            if (target.type === "MemberExpression" || target.type === "IndexExpression") {
+                // Only an assignment's: `[t[i], t[j]] = [t[j], t[i]]`.
+                const reference = this.expression(target)
+                reads.push({ name: "", target: reference, value, temp: false })
+                if (fallback) after.push(this.defaultValue(reference, fallback))
+                return
+            }
             if (target.type === "IdentifierPattern") {
                 const name = this.name(target.name)
                 const reference = mode === "declare" ? luau.identifier(name) : this.reference(target)
@@ -1399,6 +1407,11 @@ end
         mode: Mode,
         after: L.Statement[],
     ): { target: L.Expression; then: L.Statement[] } {
+        if (target.type === "MemberExpression" || target.type === "IndexExpression") {
+            const reference = this.expression(target)
+            after.push(luau.assign([reference], [initial]))
+            return { target: reference, then: [] }
+        }
         if (target.type === "IdentifierPattern") {
             if (mode === "declare") {
                 const name = this.name(target.name)
@@ -1578,11 +1591,15 @@ end
      *  the last value of a list expands, so the whole list is built as an
      *  array first and that is what expands. A call written last is one
      *  value — see `keptToOne`. */
-    private arguments(list: readonly T.Expression[]): L.Expression[] {
+    private arguments(written: readonly T.Expression[]): L.Expression[] {
+        const { items: list, many } = packs(written)
         const spreads = list.filter(a => a.type === "SpreadElement")
         if (!spreads.length) {
             const lowered = list.map(a => this.expression(a))
-            return lowered.length ? [...lowered.slice(0, -1), this.keptToOne(lowered[lowered.length - 1])] : lowered
+            const last = list.length - 1
+            return lowered.length && !many.has(list[last])
+                ? [...lowered.slice(0, -1), this.keptToOne(lowered[last])]
+                : lowered
         }
         const unpack = (value: L.Expression): L.Expression =>
             luau.call(luau.member(this.builtin("table"), "unpack"), [value])
@@ -1870,11 +1887,12 @@ end
     /** `[1, ...xs, 2]`. Without a spread it is a Luau sequence; with one, the
      *  runs of plain elements and the spread arrays are joined by `concat`. */
     private arrayExpression(node: T.ArrayExpression): L.Expression {
+        const elements = packs(node.elements).items
         // A call written last takes every value it returns: `[require(m)]`
         // is how a program asks for all of them. A Luau sequence does that
         // itself for its last element.
-        if (!node.elements.some(e => e.type === "SpreadElement")) {
-            return luau.table(node.elements.map(e => ({ type: "TableFieldPositional", value: this.expression(e as T.Expression) })))
+        if (!elements.some(e => e.type === "SpreadElement")) {
+            return luau.table(elements.map(e => ({ type: "TableFieldPositional", value: this.expression(e as T.Expression) })))
         }
         const parts: L.Expression[] = []
         let current: T.Expression[] = []
@@ -1888,7 +1906,7 @@ end
             })))
             current = []
         }
-        for (const element of node.elements) {
+        for (const element of elements) {
             if (element.type === "SpreadElement") {
                 flush(false)
                 parts.push(this.expression(element.argument))
@@ -1906,6 +1924,35 @@ end
 // ------------------------------------------------------------
 
 type Link = T.MemberExpression | T.IndexExpression | T.CallExpression | T.MethodCallExpression
+
+/** `...[a, b]` is the Luau pack `a, b`: a spread array literal is written out
+ *  as its values, not built and unpacked. A call last in the literal takes
+ *  every value it answers, as it would in the array; Luau only does that for
+ *  the last value of a list, so that call is in `many` when it ends up last,
+ *  and stays a spread of its own one-element array anywhere else. */
+function packs(list: readonly T.Expression[]): { items: T.Expression[]; many: Set<T.Expression> } {
+    const items: T.Expression[] = []
+    const many = new Set<T.Expression>()
+    const add = (elements: readonly T.Expression[]): void => {
+        for (const element of elements) {
+            if (element.type === "SpreadElement" && element.argument.type === "ArrayExpression") {
+                const inner = element.argument.elements
+                add(inner)
+                const last = inner[inner.length - 1]
+                if (last && (last.type === "CallExpression" || last.type === "MethodCallExpression")) many.add(last)
+            } else {
+                items.push(element)
+            }
+        }
+    }
+    add(list)
+    items.forEach((item, i) => {
+        if (!many.has(item) || i === items.length - 1) return
+        many.delete(item)
+        items[i] = { type: "SpreadElement", argument: { type: "ArrayExpression", elements: [item], ...spanOf(item) }, ...spanOf(item) } as T.SpreadElement
+    })
+    return { items, many }
+}
 
 /** An optional chain: the expression under its first `?.` / `?:`, and the
  *  links read from it, innermost first. */
@@ -1985,10 +2032,21 @@ function memberChain(e: L.Expression): string[] | undefined {
     return undefined
 }
 
+/** A declaration's target. A member or an index is a leaf only of a
+ *  destructuring assignment, never of a declaration. */
+function declared(target: T.BindingTarget): T.IdentifierPattern | T.ObjectPattern | T.ArrayPattern {
+    if (target.type === "MemberExpression" || target.type === "IndexExpression") {
+        throw new Error("a declaration binds names, not a member or an index")
+    }
+    return target
+}
+
 /** Every name a binding target introduces, as its pattern node. */
 function identifierPatterns(target: T.BindingTarget): T.IdentifierPattern[] {
     switch (target.type) {
         case "IdentifierPattern": return [target]
+        case "MemberExpression":
+        case "IndexExpression": return []
         case "ObjectPattern":
             return [...target.properties.flatMap(p => identifierPatterns(p.value)), ...(target.rest ? identifierPatterns(target.rest) : [])]
         case "ArrayPattern":
