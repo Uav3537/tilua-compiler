@@ -38,6 +38,7 @@ import { parse as parseLuau, parseExpressionFromSource } from "luau-parser"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
 import type { ArgumentInfo, CallSite, LoadedLowering } from "./lowering.js"
+import { languageLowering } from "./language.js"
 
 /** What lowering a file as a module of a bundle needs. */
 export interface ModuleContext {
@@ -344,18 +345,36 @@ class Lowerer {
         return this.scopes.bindings.get(id)?.kind === "global" ? node.name : undefined
     }
 
-    /** What a library says `receiver:method(...)` is. The last library
-     *  loaded is asked first, so a project's own library can answer for a
-     *  method an earlier one also claims; no answer leaves an ordinary Luau
-     *  method call, which is what a value that answers to the method itself
-     *  wants (`text:upper()`). */
+    /** The language's own lowering, then each library's, in load order. A
+     *  runtime is named by its lowering's place here (`loweringRuntime`). */
+    private get lowerings(): readonly LoadedLowering[] {
+        return (this.allLowerings ??= [languageLowering, ...(this.options.lowerings ?? [])])
+    }
+
+    private allLowerings: readonly LoadedLowering[] | undefined
+
+    /** What `receiver:method(...)` becomes, when Luau alone would not run it.
+     *
+     *  A method the receiver's metatable gave it — the analyzer says so, and
+     *  whose metatable it was (`methodSources`) — is asked of whoever declared
+     *  that metatable, and only them: the language lowers its own
+     *  (`names:filter(f)` becomes a call into its runtime), a library its own,
+     *  and one the program declared is taken at its word. Any other method is
+     *  a member of the receiver's own, which a library may still claim
+     *  (`console:log`), the last library loaded first. No answer leaves an
+     *  ordinary Luau method call: `text:upper()` reaches Lua's own. */
     private loweredMethodCall(node: T.MethodCallExpression): { callee: string; prepend: L.Expression[]; passReceiver: boolean } | undefined {
-        const lowerings = this.options.lowerings
-        if (!lowerings?.some(l => l.plugin.methodCall)) return undefined
+        const lowerings = this.lowerings
+        const source = this.options.types?.methodSources.get(node)
+        const asked = source?.origin === "language" ? [0]
+            : source?.origin === "library" ? lowerings.flatMap((l, i) => (l.library === source.library ? [i] : []))
+            : source?.origin === "program" ? []
+            : lowerings.map((_, i) => i).slice(1).reverse()
+        if (!asked.some(i => lowerings[i].plugin.methodCall)) return undefined
         const receiver = this.options.types?.typeOf.get(node.object)
         const receiverGlobal = this.globalName(node.object)
         const info = this.lazyArguments(node.arguments)
-        for (let i = lowerings.length - 1; i >= 0; i--) {
+        for (const i of asked) {
             const plugin = lowerings[i].plugin
             if (!plugin.methodCall) continue
             const answer = plugin.methodCall({
@@ -380,7 +399,7 @@ class Lowerer {
 
     /** What a library says a call to a global — `print(x)` — is. */
     private loweredGlobalCall(node: T.CallExpression): { callee: string; prepend: L.Expression[] } | undefined {
-        const lowerings = this.options.lowerings
+        const lowerings = this.lowerings
         if (!lowerings?.some(l => l.plugin.globalCall)) return undefined
         const name = this.globalName(node.callee)
         if (name === undefined) return undefined
@@ -401,7 +420,7 @@ class Lowerer {
 
     /** What a library says a global read as a value — `local p = print` — is. */
     private loweredGlobalValue(node: T.Identifier | T.MemberExpression): L.Expression | undefined {
-        const lowerings = this.options.lowerings
+        const lowerings = this.lowerings
         if (!lowerings?.some(l => l.plugin.globalValue)) return undefined
         const name = this.globalName(node)
         if (name === undefined) return undefined
@@ -434,7 +453,7 @@ class Lowerer {
         try {
             return parseExpressionFromSource(source)
         } catch (error) {
-            this.report(node, `'${this.options.lowerings![index].from}' lowered this to Luau that does not parse: `
+            this.report(node, `'${this.lowerings[index].from}' lowered this to Luau that does not parse: `
                 + `${JSON.stringify(source)} (${(error as Error).message})`)
             return undefined
         }
@@ -458,7 +477,7 @@ class Lowerer {
             ], true)))
         }
         for (const { index, runtime, name } of this.loweringUsed) {
-            const { plugin, from } = this.options.lowerings![index]
+            const { plugin, from } = this.lowerings[index]
             const source = plugin.runtime?.[runtime]
             if (source === undefined) {
                 this.diagnostics.push({
@@ -844,6 +863,7 @@ class Lowerer {
             case "ExportTypeAliasStatement":
             case "DeclareStatement":
             case "DeclareClassStatement":
+            case "DeclareMetatableStatement":
             case "ErrorStatement":
                 return []
 

@@ -761,8 +761,9 @@ function fails(name: string, result: BundleResult, message: string): void {
     })
     const definitions = [
         "declare function print(...args: unknown[]): nil",
-        "type ArrayMethods<T> = { first: (self: T[]) => T | nil, nope: (self: T[]) => T | nil }",
-        "type StringMethods = { shout: (self: string) => string }",
+        // A library adds to the language's metatables, and lowers what it adds.
+        "declare metatable<T> T[]: { __index: { first: (self: T[]) => T | nil, nope: (self: T[]) => T | nil } }",
+        "declare metatable string: { __index: { shout: (self: string) => string } }",
     ].join("\n")
 
     const root = project({
@@ -995,6 +996,29 @@ await lowers("a spread literal's last call anywhere else stays an array",
 await lowers("a spread array literal in an array is its values",
     "const xs = [0, ...[1, 2], 3]",
     "local xs = { 0, 1, 2, 3 };")
+// A string's, an array's and a table's methods are the language's: with no
+// library at all, the compiler lowers them into its own runtime. A string's
+// Lua methods stay what they are.
+{
+    const lowered = await compile([
+        "const names = [\"a\", \"bb\"]",
+        "const long = names:filter(n => #n > 1)",
+        "const up = (\"x\"):upper()",
+        "const trimmed = (\" x \"):trim()",
+        "const keys = { b: 1, a: 2 }:keys()",
+    ].join("\n"))
+    const code = lowered.code ?? ""
+    check("language methods: lowered with no library", [
+        lowered.diagnostics.map(d => d.message),
+        code.includes("tilua_array.filter(names,"),
+        code.includes(":upper()"),
+        code.includes("tilua_string.trim("),
+        /tilua_object\.keys\(\{\s*"b",\s*"a"\s*\}, false,/.test(code),
+        code.includes("function tilua_array.filter"),
+        code.includes("function tilua_array.map"),
+    ], [[], true, true, true, true, true, true])
+}
+
 // Several results are an array — a table, returned and taken apart like any.
 await lowers("several results are an array, and a destructuring reads it",
     [

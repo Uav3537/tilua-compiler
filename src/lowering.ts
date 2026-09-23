@@ -2,19 +2,21 @@
  * Loading the lowering a type library brings with it.
  *
  * The compiler lowers tilua itself — `import`, `export`, `a ? b : c`, `?.`,
- * destructuring, spreads, template strings: the things the language means on
- * its own. Everything a *library* gives a value it must also say how to run:
- * `names:filter(f)` is a call to a function because `@tilua-types/lua` declares the
- * method and ships the Luau behind it, not because the compiler has heard of
- * `filter`.
+ * destructuring, spreads, template strings, and the methods of the language's
+ * own metatables (`names:filter(f)`, see language.ts): the things the language
+ * means on its own. Everything a *library* gives a value it must also say how
+ * to run: `names:first()` is a call to a function because the library that
+ * declared `first` ships the Luau behind it, not because the compiler has heard
+ * of `first`.
  *
  * A library names its module in package.json:
  *
  *     "tilua": { "types": "index.d.tilua", "lowering": "lowering.mjs" }
  *
  * and the module's default export is a `LoweringPlugin` (declared in
- * @tilua/parser, and re-exported here). The compiler asks each plugin, the
- * last library loaded first, and takes the first answer.
+ * @tilua/parser, and re-exported here). A method a metatable gave the receiver
+ * is asked of the library that declared the metatable alone; anything else of
+ * each plugin, the last library loaded first, taking the first answer.
  */
 import { pathToFileURL } from "node:url"
 import type { LoweringPlugin } from "@tilua/parser"
@@ -30,6 +32,10 @@ export interface LoadedLowering {
     readonly plugin: LoweringPlugin
     /** The package it came from, for reporting. */
     readonly from: string
+    /** The package's definitions, as their index in the libraries the
+     *  analyzer was given: a method read from a metatable they declare is
+     *  this lowering's to answer. Absent for the language's own. */
+    readonly library?: number
 }
 
 export interface LoweringProblem {
@@ -41,7 +47,7 @@ export interface LoweringProblem {
  *  or exports the wrong shape, is reported and skipped: the rest of the build
  *  is still worth having. */
 export async function loadLowerings(
-    modules: readonly { file: string; from: string }[],
+    modules: readonly { file: string; from: string; library?: number }[],
 ): Promise<{ lowerings: LoadedLowering[]; problems: LoweringProblem[] }> {
     const lowerings: LoadedLowering[] = []
     const problems: LoweringProblem[] = []
@@ -56,7 +62,7 @@ export async function loadLowerings(
                 })
                 continue
             }
-            lowerings.push({ plugin: plugin as LoweringPlugin, from: module.from })
+            lowerings.push({ plugin: plugin as LoweringPlugin, from: module.from, library: module.library })
         } catch (error) {
             problems.push({
                 file: module.file,

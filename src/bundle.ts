@@ -475,7 +475,7 @@ function analyzeModules(
 ): {
     types: Map<string, TypeAnalysis>
     diagnostics: BundleDiagnostic[]
-    lowerings: { file: string; from: string }[]
+    lowerings: { file: string; from: string; library: number }[]
 } {
     const out: BundleDiagnostic[] = []
     const analyses = new Map<string, TypeAnalysis>()
