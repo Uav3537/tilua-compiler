@@ -1582,6 +1582,13 @@ end
     private callValues(node: T.CallExpression | T.MethodCallExpression): L.Expression {
         const chain = optionalChain(node)
         if (chain) return this.optionalChainExpression(chain)
+        // `super(a)` and `super.m(a)` run on this instance; `expression` is
+        // what knows that. Taken through the chain below, `super` would be an
+        // ordinary object and `super(a)` a call of the base class table.
+        if (node.type === "CallExpression" && (node.callee.type === "SuperExpression" ||
+            (node.callee.type === "MemberExpression" && node.callee.object.type === "SuperExpression"))) {
+            return this.expression(node)
+        }
         // A name that is called is not read as a value: `print(x)` is
         // `globalCall`'s to answer, and asking `globalValue` about the
         // `print` in it would emit a runtime nothing then uses.

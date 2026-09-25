@@ -43,7 +43,7 @@ import { readFileSync, statSync } from "node:fs"
 import { dirname, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries,
-    directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, ParseError, LexError,
+    directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, ParseError, LexError, luauString,
     type ModuleExports, type Program, type ScopeAnalysis, type TiluaConfig, type TypeAnalysis, type Directives,
 } from "@tilua/parser"
 import { parse as parseLuau, parseExpressionFromSource, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
@@ -258,7 +258,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const result = names.fresh("result")
     const entryStatements = parseLuau(`
 local ${ok}, ${result} = xpcall(function()
-    return ${G}.require(${JSON.stringify(sources.get(entry)!.name)})
+    return ${G}.require(${luauString(sources.get(entry)!.name)})
 end, ${G}.fail)
 if not ${ok} then
     error(${result}, 0)
@@ -294,19 +294,64 @@ ${G} = {
     -- and a traceback of those places follows. A message that is not a string
     -- is left as it is, and a position that is not this bundle's (a library
     -- that raised its error with one already mapped) is left alone.
+    --
+    -- It is an \`xpcall\` handler, and a handler that fails loses the error
+    -- altogether: Luau reports only "error in error handling". So the work is
+    -- done under \`pcall\`, leaning on nothing it has not checked is there (an
+    -- executor may lack \`debug.info\`, or refuse it), and an error it cannot
+    -- map is still answered as Luau raised it, with why.
     fail = function(message)
+        -- Taken first, before anything that can fail. Level 3 is the frame
+        -- that raised: past \`pcall\` and this handler.
+        local trace
+        if debug ~= nil and debug.traceback ~= nil then
+            local ok, text = pcall(debug.traceback, "", 3)
+            if ok and type(text) == "string" then
+                trace = text
+            end
+        end
+        local ok, described = pcall(${G}.describe, message, trace)
+        if ok then
+            return described
+        end
+        if type(message) ~= "string" then
+            return message
+        end
+        local why = type(described) == "string" and described or "unknown"
+        return message .. "\\n(tilua could not map this error to the project's files: " .. why .. ")" .. (trace or "")
+    end,
+    -- \`fail\`'s work. \`trace\` is a traceback from where the error was
+    -- raised, or nil when none could be taken.
+    describe = function(message, trace)
         if type(message) ~= "string" then
             return message
         end
         local lines = ${G}.lines
         if lines == nil then
-            return debug.traceback(message, 2)
+            return message .. (trace or "")
         end
+        -- The bundle's name, as a position in a message spells it: where this
+        -- function is, asked of the debug library by the function rather
+        -- than by a level, which \`pcall\` would shift. Failing that, a message
+        -- starts with the position it was raised at.
         local chunk
-        if debug.info ~= nil then
-            chunk = debug.info(1, "s")
-        else
-            chunk = debug.getinfo(1, "S").short_src
+        if debug ~= nil and debug.info ~= nil then
+            local found, source = pcall(debug.info, ${G}.describe, "s")
+            if found and type(source) == "string" then
+                chunk = source
+            end
+        end
+        if chunk == nil and debug ~= nil and debug.getinfo ~= nil then
+            local found, info = pcall(debug.getinfo, ${G}.describe, "S")
+            if found and type(info) == "table" and type(info.short_src) == "string" then
+                chunk = info.short_src
+            end
+        end
+        if chunk == nil then
+            chunk = message:match("^(.-):%d+:")
+        end
+        if chunk == nil then
+            return message .. (trace or "")
         end
         local prefix = chunk:gsub("%p", "%%%0")
         local function place(line)
@@ -320,7 +365,7 @@ ${G} = {
             return place(line)
         end)
         local frames = {}
-        for frame in debug.traceback("", 2):gmatch("[^\\n]+") do
+        for frame in (trace or ""):gmatch("[^\\n]+") do
             local line = frame:match(prefix .. ":(%d+)")
             local at = line ~= nil and place(line) or nil
             if at ~= nil then

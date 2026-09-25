@@ -5,6 +5,7 @@
  * only node shapes, never positions — so every node gets the same empty span.
  */
 import type * as L from "luau-parser"
+import { LUAU_KEYWORDS, isLuauName } from "@tilua/parser"
 
 const NO_SPAN = { line: { start: 0, end: 0 }, column: { start: 0, end: 0 } }
 const span = (): L.BaseNode => ({ line: { ...NO_SPAN.line }, column: { ...NO_SPAN.column } })
@@ -124,14 +125,7 @@ export const program = (statements: L.Statement[]): L.Program => ({ type: "Progr
 // Names
 // ------------------------------------------------------------
 
-/** Luau's reserved words. tilua reserves most of them too — `local` is the
- *  exception, so a tilua name can still be one of these. */
-export const LUAU_KEYWORDS = new Set([
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
-    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
-])
-
-/** Can `name` be written bare in Luau — as a variable, `t.name` or `{ name = v }`? */
-export function isLuauName(name: string): boolean {
-    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && !LUAU_KEYWORDS.has(name)
-}
+// Luau's reserved words, and what a bare name may be, are the parser's: the
+// compiler, the type libraries' lowerings and anything else writing Luau agree
+// on them.
+export { LUAU_KEYWORDS, isLuauName }

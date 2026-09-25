@@ -13,7 +13,7 @@
  * analyzer read from one of the language's metatables (`MethodSource`).
  */
 import { readFileSync } from "node:fs"
-import type { LoweringPlugin, Type } from "@tilua/parser"
+import { luauString, type LoweringPlugin, type Type } from "@tilua/parser"
 import type { LoadedLowering } from "./lowering"
 
 /** A runtime file, shipped beside `dist` (and `src`). */
@@ -68,7 +68,7 @@ function objectKeys(type: Type | undefined): { known: string; open: string } {
     }
     const order = JSON.stringify(orders[0] ?? [])
     const known = orders.length && orders.every(keys => JSON.stringify(keys) === order)
-        ? `{ ${orders[0].map(key => JSON.stringify(key)).join(", ")} }`
+        ? `{ ${orders[0].map(key => luauString(key)).join(", ")} }`
         : "nil"
     return { known, open: String(open) }
 }

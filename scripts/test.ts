@@ -379,6 +379,52 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
             "    at src/util.tilua:3 (boom)",
             "    at src/main.tilua:3 (load)",
         ])
+
+        // The handler runs where an executor may have no `debug.info`, or
+        // refuse it. A handler that fails leaves Luau only "error in error
+        // handling", so it must not: the error is still mapped, from the
+        // message's own position. Written on the bundle's first line, so no
+        // line moves.
+        const hostile = (name: string, prelude: string, expected: string[]) => {
+            const altered = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
+            writeFileSync(altered, prelude + result.code)
+            let said = ""
+            try {
+                execFileSync(luauBinary, [altered], { encoding: "utf8", stdio: "pipe" })
+            } catch (error) {
+                said = (error as { stderr?: string }).stderr ?? ""
+            }
+            check(name, said.split(/\r?\n/).slice(0, expected.length), expected)
+        }
+        hostile("bundle: an error is mapped with no debug.info", "debug = { traceback = debug.traceback }; ", [
+            "src/util.tilua:3: attempt to index nil with 'value'",
+            "    at src/util.tilua:3 (boom)",
+        ])
+        hostile("bundle: an error is mapped where debug.info refuses",
+            "local tb = debug.traceback; debug = { info = function() error(\"restricted\") end, traceback = tb }; ", [
+                "src/util.tilua:3: attempt to index nil with 'value'",
+                "    at src/util.tilua:3 (boom)",
+            ])
+        hostile("bundle: an error is mapped with no debug library at all", "debug = {}; ", [
+            "src/util.tilua:3: attempt to index nil with 'value'",
+        ])
+        // And if mapping itself breaks, the error as Luau raised it, and why.
+        const brokenCode = result.code.replace(/^(local lines = \w+\.lines;)$/m, `$1 error("mapping broke");`)
+        check("bundle: the mapping can be broken for the next check", brokenCode !== result.code, true)
+        const broken = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
+        writeFileSync(broken, brokenCode)
+        let said = ""
+        try {
+            execFileSync(luauBinary, [broken], { encoding: "utf8", stdio: "pipe" })
+        } catch (error) {
+            said = (error as { stderr?: string }).stderr ?? ""
+        }
+        const lines = said.split(/\r?\n/)
+        check("bundle: an error the handler cannot map is still reported, with why", [
+            /:\d+: attempt to index nil with 'value'$/.test(lines[0]),
+            /^\(tilua could not map this error to the project's files: .*mapping broke\)$/.test(lines[1]),
+            said.includes("error in error handling"),
+        ], [true, true, false])
     }
 }
 
@@ -636,7 +682,9 @@ function fails(name: string, result: BundleResult, message: string): void {
             `const point: Point = { x: 1, y: 2 }`,
             `const { x, y: py = 9, ...others } = { ...point, z: 3, w: 4 }`,
             `let count = 0`,
-            `for (const key in pairs(others)) { count += 1 }`,
+            // A table is walked as it is. Not `pairs(others)`: with no library
+            // that is Luau's own, answering three values where tilua has one.
+            `for (const value in others) { count += 1 }`,
             `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
             `function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number {`,
             `    return (a + b) * scale`,
@@ -1017,6 +1065,36 @@ await lowers("a spread array literal in an array is its values",
         code.includes("function tilua_array.filter"),
         code.includes("function tilua_array.map"),
     ], [[], true, true, true, true, true, true])
+}
+
+// A table's `Object` methods: typed, and run.
+{
+    const root = project({
+        "main.tilua": [
+            "declare function setmetatable<T>(t: T, mt: unknown): T",
+            "const base = setmetatable({ own: 1 }, { __index: { lent: 2 } })",
+            "print(base:hasOwn(\"own\"), base:hasOwn(\"lent\"), base:hasOwnProperty(\"own\"))",
+            "const merged = { a: 1 }:assign({ b: \"two\" }, { a: 3 })",
+            "const a: number = merged.a",
+            "const b: string = merged.b",
+            "print(a, b)",
+            // Four sources: past what the overloads spell out, and a nil skipped.
+            "const many = { a: 1 }:assign({ b: 2 }, nil, { c: 3 }, { d: 4 })",
+            "print(many:hasOwn(\"b\"), many:hasOwn(\"d\"))",
+            "const point = { x: 1 }",
+            "print(point:isFrozen())",
+            "const frozen = point:freeze()",
+            "print(frozen == point, point:isFrozen(), frozen.x)",
+        ].join("\n"),
+    })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
+    check("object methods: type-check", result.diagnostics.map(d => d.message), [])
+    runs("object methods: hasOwn, assign, freeze, isFrozen", result, [
+        "true\tfalse\ttrue", "3\ttwo", "true\ttrue", "false", "true\ttrue\t1",
+    ])
+    const readonly = await bundle({ entry: join(project({ "main.tilua": "const p = { x: 1 }:freeze()\np.x = 2\n" }), "main.tilua"), config: { types: [] } })
+    check("object methods: what freeze answers is readonly",
+        readonly.diagnostics.map(d => d.message), ["Cannot assign to 'x' because it is a read-only property"])
 }
 
 // Several results are an array — a table, returned and taken apart like any.

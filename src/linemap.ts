@@ -20,6 +20,7 @@
  * is abandoned rather than guessed at: a wrong line is worse than none.
  */
 import type { Program, Statement } from "luau-parser"
+import { luauString } from "@tilua/parser"
 
 /** Where a statement was written. */
 export interface Origin {
@@ -86,6 +87,6 @@ export function buildLineMap(
  *  and it is the one thing in the output whose own line numbers do not matter. */
 export function lineMapSource(map: ReadonlyMap<number, Origin>): string {
     const entries = [...map.entries()].sort((a, b) => a[0] - b[0])
-    const quoted = (s: string): string => JSON.stringify(s.replace(/\\/g, "/"))
+    const quoted = (s: string): string => luauString(s.replace(/\\/g, "/"))
     return `{${entries.map(([line, o]) => `[${line}]={${quoted(o.file)},${o.line}}`).join(",")}}`
 }
