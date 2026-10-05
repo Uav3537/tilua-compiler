@@ -5,7 +5,7 @@ local __NAME__ = {}
 -- follow the named ones. With no one order to give (`known` is nil), every
 -- key is listed, in the order `pairs` walks them.
 local function keysOf(known, open, t)
-	local out = {}
+	local out = __ARRAY__({})
 	if known == nil then
 		for key in pairs(t) do
 			out[#out + 1] = key
@@ -37,7 +37,7 @@ end
 -- rather than moving everything after it up one.
 function __NAME__.values(known, open, t)
 	local keys = keysOf(known, open, t)
-	local out = {}
+	local out = __ARRAY__({})
 	for i = 1, #keys do
 		out[i] = t[keys[i]]
 	end
@@ -46,9 +46,9 @@ end
 
 function __NAME__.entries(known, open, t)
 	local keys = keysOf(known, open, t)
-	local out = {}
+	local out = __ARRAY__({})
 	for i = 1, #keys do
-		out[i] = { keys[i], t[keys[i]] }
+		out[i] = __ARRAY__({ keys[i], t[keys[i]] })
 	end
 	return out
 end

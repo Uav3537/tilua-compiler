@@ -19,7 +19,7 @@ function __NAME__.findIndex(t, test)
 end
 
 function __NAME__.filter(t, test)
-	local out = {}
+	local out = __ARRAY__({})
 	for i = 1, #t do
 		if test(t[i], i) then
 			out[#out + 1] = t[i]
@@ -29,7 +29,7 @@ function __NAME__.filter(t, test)
 end
 
 function __NAME__.map(t, transform)
-	local out = {}
+	local out = __ARRAY__({})
 	for i = 1, #t do
 		out[i] = transform(t[i], i)
 	end
@@ -95,7 +95,7 @@ function __NAME__.join(t, separator)
 end
 
 function __NAME__.concat(t, ...)
-	local out = {}
+	local out = __ARRAY__({})
 	table.move(t, 1, #t, 1, out)
 	for i = 1, select("#", ...) do
 		local part = select(i, ...)
@@ -114,7 +114,7 @@ function __NAME__.slice(t, start, stop)
 	if to < 0 then to = n + to + 1 end
 	if from < 1 then from = 1 end
 	if to > n then to = n end
-	local out = {}
+	local out = __ARRAY__({})
 	for i = from, to do
 		out[#out + 1] = t[i]
 	end
@@ -123,7 +123,7 @@ end
 
 -- One level, as JavaScript's `flat()` does by default.
 function __NAME__.flat(t)
-	local out = {}
+	local out = __ARRAY__({})
 	for i = 1, #t do
 		local value = t[i]
 		if type(value) == "table" then

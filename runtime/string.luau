@@ -88,7 +88,7 @@ local function values(...)
 	if select("#", ...) <= 1 and (...) == nil then
 		return nil
 	end
-	return { ... }
+	return __ARRAY__({ ... })
 end
 
 function __NAME__.find(s, pattern, init, plain)
@@ -107,7 +107,7 @@ function __NAME__.byte(s, i, j)
 	if j == nil then
 		return (string.byte(s, i))
 	end
-	return { string.byte(s, i, j) }
+	return __ARRAY__({ string.byte(s, i, j) })
 end
 
 -- An iterator function: each call is one match's captures, as an array.

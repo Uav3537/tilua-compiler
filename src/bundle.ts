@@ -176,6 +176,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
                 require: requireExpression,
                 lines: `${G}.lines`,
                 fail: `${G}.fail`,
+                arrays: `${G}.arrays`,
                 resolve: specifier => {
                     const target = resolveModulePath(file, specifier, config)
                     if (!target || target.endsWith(".d.tilua") || !sources.has(target)) return undefined
@@ -231,6 +232,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     // `...` — and every module reaches it, so it comes before them all.
     if ([...modules.values()].some(m => m.usesScriptArgs)) {
         program.body.statements.unshift(luau.local(["scriptArgs"], [luau.table([{ type: "TableFieldPositional", value: { type: "VarargExpression" } as never }])]))
+        program.body.statements.push(...parseLuau(`${G}.arrays[scriptArgs] = true`).body.statements)
     }
     const modulesTable = assignment.type === "AssignmentStatement" && assignment.values[0].type === "TableExpression"
         ? (assignment.values[0].fields.find(f => f.type === "TableFieldNamed" && f.name.name === "modules") as { value: TableExpression } | undefined)?.value
@@ -287,6 +289,9 @@ function runtime(G: string): string {
 local ${G}
 ${G} = {
     modules = {},
+    -- Every array the program made, so \`typeof\` can tell one from an object.
+    -- The keys are held weakly: being written down keeps no array alive.
+    arrays = setmetatable({}, { __mode = "k" }),
     -- Filled in just before the entry runs: bundle line -> { file, line }.
     lines = nil,
     -- What an error nothing caught says, in the project's files: the bundle's

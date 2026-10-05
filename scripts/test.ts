@@ -35,6 +35,29 @@ function check(name: string, actual: unknown, expected: unknown): void {
 
 const flat = (code: string): string => code.trim().split("\n").join(" ")
 
+/** The record of arrays `typeof` reads, as a single file sets it up. */
+const ARRAYS = "local tilua_arrays = setmetatable({}, { __mode = \"k\" }); "
+    + "local function tilua_asArray(t) tilua_arrays[t] = true; return t; end;"
+
+/** `code` without the bookkeeping every array costs — the record above, and
+ *  `tilua_asArray(...)` around each new one — so that a case reads as what it
+ *  is about. The cases under "typeof" look at the bookkeeping itself. */
+function unmarked(code: string): string {
+    let out = code.replace(ARRAYS + " ", "").replace(ARRAYS, "")
+    for (;;) {
+        const at = out.indexOf("tilua_asArray(")
+        if (at < 0) return out
+        const open = at + "tilua_asArray".length
+        let depth = 0
+        let close = open
+        for (; close < out.length; close++) {
+            if (out[close] === "(") depth++
+            else if (out[close] === ")" && --depth === 0) break
+        }
+        out = out.slice(0, at) + out.slice(open + 1, close) + out.slice(close + 1)
+    }
+}
+
 function validLuau(name: string, code: string): void {
     try {
         parseLuau(code)
@@ -86,6 +109,17 @@ async function lowers(name: string, source: string, expected: string): Promise<v
         return
     }
     validLuau(name, result.code)
+    check(name, unmarked(flat(result.code)), expected)
+}
+
+/** As `lowers`, with the arrays' bookkeeping left in. */
+async function lowersMarked(name: string, source: string, expected: string): Promise<void> {
+    const result = await compile(source)
+    if (result.code === undefined) {
+        failures.push(`${name}\n    did not compile: ${result.diagnostics.map(d => `${d.line}:${d.column} ${d.message}`).join("; ")}`)
+        return
+    }
+    validLuau(name, result.code)
     check(name, flat(result.code), expected)
 }
 
@@ -100,7 +134,7 @@ function lowers51(name: string, source: string, expected: string): void {
     const code = printLuau(luau.program(result.statements))
     validLuau(name, code)
     validLua51(name, code)
-    check(name, flat(code), expected)
+    check(name, unmarked(flat(code)), expected)
 }
 
 /** The Lua 5.1 lowering refuses `source`, saying `reason`. */
@@ -1443,6 +1477,70 @@ await lowers("class: new is a call of the class's own constructor",
         [],
         ["Type 'string' is not assignable to 'number'"],
         true,
+    ])
+}
+
+// --- typeof ---------------------------------------------------------------------
+// Luau cannot tell an array from an object — both are tables — so every array
+// the program makes is written down as one, and `typeof` looks there.
+await lowersMarked("typeof: an array is written down as one where it is made",
+    "const xs = [1]\nconst o = { a: 1 }",
+    `${ARRAYS} local xs = tilua_asArray({ 1 }); local o = { a = 1 };`)
+{
+    const lowered = await compile("declare v: unknown\ndeclare a: number[] | nil\ndeclare o: { x: number }\nconst k = [typeof v, typeof a, typeof (o)]")
+    const code = flat(lowered.code ?? "")
+    check("typeof: a call of the runtime, told what the type already says", [
+        lowered.diagnostics.map(d => d.message),
+        code.includes("local function tilua_typeof(value, known) local name = typeof(value);"),
+        code.includes("tilua_asArray({ tilua_typeof(v), tilua_typeof(a, \"array\"), tilua_typeof(o, \"object\") })"),
+    ], [[], true, true])
+    const program = parseTilua("const k = typeof v")
+    const lua51 = flat(printLuau(luau.program(lower(program, analyzeScopesTilua(program), { target: "lua51" }).statements)))
+    check("typeof: Lua 5.1 has only `type`", lua51.includes("local name = type(value);"), true)
+}
+// One record for the whole bundle: an array another module made is one here.
+{
+    const root = project({
+        "other.tilua": [
+            "export function empty(): number[] {",
+            "    return []",
+            "}",
+            "export function pass(...args: number[]) {",
+            "    return args",
+            "}",
+        ].join("\n"),
+        "main.tilua": [
+            "import { empty, pass } from \"./other\"",
+            "const name = (v: unknown) => typeof v",
+            "print(name([]), name({}), name([1]), name({ a: 1 }))",
+            "print(name(empty()), name(pass(1, 2)), name(pass()))",
+            "print(name(nil), name(1), name(\"s\"), name(true), name(print))",
+            "const xs = [1, 2]",
+            "print(name(xs:filter(x => x > 5)), name(xs:map(x => x)), name({ a: 1 }:keys()))",
+            "const [first, ...rest] = [1]",
+            "print(name(rest), name([...rest]))",
+            "class A { }",
+            "print(name(A.new()))",
+            "print(typeof xs, typeof { a: 1 }, typeof (xs) == \"array\")",
+            "print(name(scriptArgs))",
+            "const v: unknown = xs",
+            "if (typeof v == \"array\") {",
+            "    print(#v)",
+            "}",
+        ].join("\n"),
+    })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
+    check("typeof: type-check", result.diagnostics.map(d => d.message), [])
+    runs("typeof: arrays and objects, empty ones included", result, [
+        "array\tobject\tarray\tobject",
+        "array\tarray\tarray",
+        "nil\tnumber\tstring\tboolean\tfunction",
+        "array\tarray\tarray",
+        "array\tarray",
+        "object",
+        "array\tobject\ttrue",
+        "array",
+        "2",
     ])
 }
 

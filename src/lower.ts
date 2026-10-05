@@ -57,6 +57,9 @@ export interface ModuleContext {
      *  reads, as `__FAIL__`, to report an error from a callback the way an
      *  error that reached the entry is reported. */
     readonly fail?: string
+    /** Luau reaching the bundle's record of which tables are arrays, so that
+     *  every module marks and reads the same one (`typeof`). */
+    readonly arrays?: string
 }
 
 export interface LowerOptions {
@@ -135,7 +138,7 @@ export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerO
 /** A runtime helper the output needs, emitted once at the top of the file.
  *  `assign` and `concat` are the language's own (spreads); a `lowering` is a
  *  table a type library asked for, by the key it gave it. */
-type Helper = "assign" | "concat" | { lowering: number; runtime: string }
+type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | { lowering: number; runtime: string }
 
 type Mode = "declare" | "assign"
 
@@ -175,16 +178,16 @@ class Lowerer {
         const body = this.options.module
             ? this.module(this.options.module)
             : this.topLevel(this.source.body.statements)
-        const helpers = this.helperDefinitions()
-        // Captured before any of the file's code runs — before its own `table`.
-        const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
         // A file compiled on its own is the chunk: its `...` is what it was
         // started with. A bundle sets this up once, for every module.
         const scriptArgs = this.usesScriptArgs && !this.options.module
-            ? [luau.local(["scriptArgs"], [luau.table([{ type: "TableFieldPositional", value: vararg() }])])]
+            ? [luau.local(["scriptArgs"], [this.array(luau.table([{ type: "TableFieldPositional", value: vararg() }]))])]
             : []
+        const helpers = this.helperDefinitions()
+        // Captured before any of the file's code runs — before its own `table`.
+        const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
         return {
-            statements: [...scriptArgs, ...captured, ...helpers, ...this.classRuntimeStatements(), ...body],
+            statements: [...captured, ...helpers, ...scriptArgs, ...this.classRuntimeStatements(), ...body],
             exportsName: this.exportsName,
             module: this.info,
             diagnostics: this.diagnostics,
@@ -239,13 +242,46 @@ class Lowerer {
         return luau.identifier(local)
     }
 
-    private helper(kind: "assign" | "concat"): L.Identifier {
+    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof"): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
-            name = this.names.fresh(`tilua_${kind}`)
+            // `tilua_array` is the array methods' own table.
+            name = this.names.fresh(`tilua_${kind === "array" ? "asArray" : kind}`)
             this.helpers.set(kind, name)
         }
         return luau.identifier(name)
+    }
+
+    // `typeof v` tells an array from an object, which Luau cannot: both are
+    // tables. So every array the program makes — `[a, b]`, a rest parameter,
+    // what `:map` answers — is written down as one, in a table that holds its
+    // keys weakly, and `typeof` looks there. A table nothing wrote down (one a
+    // Lua library made) is told by its type where that says, and by its shape
+    // where it does not.
+
+    /** `value`, a new array, written down as one. */
+    private array(value: L.Expression): L.Expression {
+        const marked = luau.call(this.helper("array"), [value])
+        this.marked.add(marked)
+        return marked
+    }
+
+    /** The calls `array` made: each answers the one table it was given. */
+    private readonly marked = new WeakSet<L.Expression>()
+
+    /** Luau reaching the record of arrays: the bundle's, or this file's own. */
+    private arrays(): string {
+        return this.options.module?.arrays ?? this.helper("arrays").name
+    }
+
+    private typeofExpression(node: T.UnaryExpression): L.Expression {
+        const known = this.options.types?.typeofTables.get(node)
+        // `typeof (v)` is `typeof v`. Alone, the value is the call's last
+        // argument, where a call would hand on everything it returns.
+        let argument = node.argument
+        while (argument.type === "ParenthesizedExpression") argument = argument.expression
+        const value = this.expression(argument)
+        return luau.call(this.helper("typeof"), known ? [value, luau.string(known)] : [this.keptToOne(value)])
     }
 
     /** The local a library's runtime table gets in this file, emitting it the
@@ -461,6 +497,51 @@ class Lowerer {
 
     private helperDefinitions(): L.Statement[] {
         const out: L.Statement[] = []
+        // A runtime that answers with a new array marks it (`__ARRAY__`), and
+        // so does `concat`: read first, so the marker is defined above them.
+        const runtimes = this.runtimeDefinitions()
+        if (this.helpers.has("concat")) this.helper("array")
+        const marker = this.helpers.get("array")
+        const typeOf = this.helpers.get("typeof")
+        if (marker || typeOf) {
+            const arrays = this.arrays()
+            const own = this.helpers.get("arrays")
+            if (own) {
+                out.push(...parseLuau(`local ${own} = ${this.builtin("setmetatable").name}({}, { __mode = "k" })`).body.statements)
+            }
+            if (marker) {
+                out.push(...parseLuau(`
+local function ${marker}(t)
+	${arrays}[t] = true
+	return t
+end`).body.statements)
+            }
+            if (typeOf) {
+                // `known`: what the value's type says a table is. With none,
+                // a table the program made is in the record; an instance of a
+                // class has a metatable; anything else is read by its shape.
+                out.push(...parseLuau(`
+local function ${typeOf}(value, known)
+	local name = ${this.builtin(this.lua51 ? "type" : "typeof").name}(value)
+	if name ~= "table" then
+		return name
+	end
+	if known ~= nil then
+		return known
+	end
+	if ${arrays}[value] then
+		return "array"
+	end
+	if ${this.builtin("getmetatable").name}(value) ~= nil then
+		return "object"
+	end
+	if #value > 0 then
+		return "array"
+	end
+	return "object"
+end`).body.statements)
+            }
+        }
         const assign = this.helpers.get("assign")
         if (assign) {
             // assign(target, ...sources): copy each source's keys into target, in order.
@@ -476,6 +557,29 @@ class Lowerer {
                 luau.returns([luau.identifier("target")]),
             ], true)))
         }
+        out.push(...runtimes)
+        const concat = this.helpers.get("concat")
+        if (concat) {
+            // concat(...parts): one array holding every part's elements, in order.
+            out.push(luau.localFunction(concat, luau.functionBody([], [
+                luau.local(["result"], [this.array(luau.table([]))]),
+                luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
+                    luau.local(["part"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
+                    luau.callStatement(luau.call(luau.member(this.builtin("table"), "move"), [
+                        luau.identifier("part"), luau.number(1), luau.unary("#", luau.identifier("part")),
+                        luau.binary("+", luau.unary("#", luau.identifier("result")), luau.number(1)),
+                        luau.identifier("result"),
+                    ])),
+                ]),
+                luau.returns([luau.identifier("result")]),
+            ], true)))
+        }
+        return out
+    }
+
+    /** The runtime tables the file's libraries were asked for. */
+    private runtimeDefinitions(): L.Statement[] {
+        const out: L.Statement[] = []
         for (const { index, runtime, name } of this.loweringUsed) {
             const { plugin, from } = this.lowerings[index]
             const source = plugin.runtime?.[runtime]
@@ -494,23 +598,8 @@ class Lowerer {
             out.push(...parseLuau(source
                 .replace(/__NAME__/g, name)
                 .replace(/__LINES__/g, lines)
-                .replace(/__FAIL__/g, fail)).body.statements)
-        }
-        const concat = this.helpers.get("concat")
-        if (concat) {
-            // concat(...parts): one array holding every part's elements, in order.
-            out.push(luau.localFunction(concat, luau.functionBody([], [
-                luau.local(["result"], [luau.table([])]),
-                luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
-                    luau.local(["part"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
-                    luau.callStatement(luau.call(luau.member(this.builtin("table"), "move"), [
-                        luau.identifier("part"), luau.number(1), luau.unary("#", luau.identifier("part")),
-                        luau.binary("+", luau.unary("#", luau.identifier("result")), luau.number(1)),
-                        luau.identifier("result"),
-                    ])),
-                ]),
-                luau.returns([luau.identifier("result")]),
-            ], true)))
+                .replace(/__FAIL__/g, fail)
+                .replace(/__ARRAY__/g, () => this.helper("array").name)).body.statements)
         }
         return out
     }
@@ -1397,7 +1486,7 @@ end
             if (pattern.rest) {
                 // `...rest`: a new array of the elements after the named ones.
                 const elements = luau.call(luau.member(this.builtin("table"), "move"), [
-                    source, luau.number(pattern.elements.length + 1), luau.unary("#", source), luau.number(1), luau.table([]),
+                    source, luau.number(pattern.elements.length + 1), luau.unary("#", source), luau.number(1), this.array(luau.table([])),
                 ])
                 const rest = this.restTarget(pattern.rest, elements, mode, after)
                 after.push(...rest.then)
@@ -1465,7 +1554,7 @@ end
             // `...rest: T[]` is Lua's own `{...}`: the function still takes
             // `...`, and the array of it is a local the body reads by name.
             if (p.rest) {
-                prelude.push(luau.local([this.name(p.name)], [luau.table([{ type: "TableFieldPositional", value: vararg() }])]))
+                prelude.push(luau.local([this.name(p.name)], [this.array(luau.table([{ type: "TableFieldPositional", value: vararg() }]))]))
                 continue
             }
             const name = p.pattern ? this.names.fresh("arg") : this.name(p.name)
@@ -1529,6 +1618,7 @@ end
             }
 
             case "UnaryExpression":
+                if (node.operator === "typeof") return this.typeofExpression(node)
                 return luau.unary(node.operator, this.expression(node.argument))
 
             case "SuperExpression":
@@ -1604,7 +1694,7 @@ end
      *  kept to one there, `f((g()))`. Every value is taken only where the
      *  program asks for them, as an array's last element: `[g()]`. */
     private keptToOne(value: L.Expression): L.Expression {
-        return expandsToMany(value) ? luau.parenthesized(value) : value
+        return expandsToMany(value) && !this.marked.has(value) ? luau.parenthesized(value) : value
     }
 
     /** Is this `scriptArgs` the language's own, not a name the file declared? */
@@ -1919,7 +2009,7 @@ end
         // is how a program asks for all of them. A Luau sequence does that
         // itself for its last element.
         if (!elements.some(e => e.type === "SpreadElement")) {
-            return luau.table(elements.map(e => ({ type: "TableFieldPositional", value: this.expression(e as T.Expression) })))
+            return this.array(luau.table(elements.map(e => ({ type: "TableFieldPositional", value: this.expression(e as T.Expression) }))))
         }
         const parts: L.Expression[] = []
         let current: T.Expression[] = []

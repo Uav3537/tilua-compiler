@@ -54,9 +54,10 @@ JavaScript module the build loads.
 | tilua | Luau |
 |---|---|
 | `const { a, b } = value` | `local a, b = value.a, value.b` |
-| `const [x, ...rest] = list` | `local x = list[1]; local rest = table.move(list, 2, #list, 1, {})` |
+| `const [x, ...rest] = list` | `local x = list[1]; local rest = table.move(list, 2, #list, 1, {})` — `{}` written down as an array |
 | `const { a = 1 } = t` | `local a = t.a; if a == nil then a = 1 end` |
-| `[1, 2]` / `{ a: 1, b }` | `{ 1, 2 }` / `{ a = 1, b = b }` |
+| `[1, 2]` / `{ a: 1, b }` | `tilua_asArray({ 1, 2 })` / `{ a = 1, b = b }` — see `typeof` below |
+| `typeof v` | `tilua_typeof(v)`, or `tilua_typeof(v, "array")` where `v`'s type already says which table it is |
 | `{ ...base, a: 1 }` / `[...xs, 1]` | a small helper copying the parts in order |
 | `` `${a} any` `` | `("%s any"):format(tostring(a))` |
 | `a?.b` | `if a == nil then nil else a.b` |
@@ -76,6 +77,26 @@ JavaScript module the build loads.
 | `f(...xs, a)` | the list built first, then `table.unpack` of it |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
+
+## `typeof`, arrays and objects
+
+Luau cannot tell an array from an object: both are tables, and an empty one
+has nothing to go by. So every array the program makes is written down as
+one where it is made — `[a, b]`, a rest parameter, `scriptArgs`, what
+`:map`, `:filter`, `:keys` and the rest answer — in a table that holds its
+keys weakly, one for the whole bundle. `tilua_asArray(t)` does that and hands
+`t` back.
+
+`typeof v` is Luau's `typeof` (Lua 5.1's `type`) for anything but a table.
+For a table it answers, in order:
+
+1. what `v`'s type says, where every table it can be is an array, or every
+   one an object — passed by the compiler, so nothing is looked up;
+2. `"array"` if it was written down as one;
+3. `"object"` if it has a metatable — an instance of a class;
+4. `"array"` if it has a first element, and `"object"` otherwise: a table the
+   program did not make (one `JSONDecode` answered) is read by its shape, and
+   an empty one of those is an `"object"`.
 
 ## Classes
 
@@ -185,7 +206,7 @@ argument (`arguments`: type, the code it was written as, and what a name was
 declared as). An answer can `prepend` Luau expressions ahead of the written
 arguments. `globalCall` and `globalValue` answer for a global, such as
 `print(x)` or a bare `print`. A runtime can read `__LINES__` to reach the
-bundle's line map. See the `@tilua/parser` README for the details.
+bundle's line map, and wraps a new array it answers with in `__ARRAY__(...)`. See the `@tilua/parser` README for the details.
 `console:log` is not built into the compiler: `@tilua-types/lua` implements it
 with these hooks.
 
