@@ -14,7 +14,7 @@
 import { execFileSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { parse as parseLuau, print as printLuau } from "luau-parser"
 import { parse as parseTilua, analyzeScopes as analyzeScopesTilua, analyzeTypes as analyzeTypesTilua } from "@tilua/parser"
 import { bundle, compile, type BundleResult } from "../src/index.js"
@@ -77,6 +77,8 @@ const LUAU_ONLY: Record<string, (node: Record<string, unknown>) => boolean> = {
     IfElseExpression: () => true,
     BinaryExpression: node => node.operator === "//",
     NumberLiteral: node => typeof node.raw === "string" && (node.raw.includes("_") || /^0[bB]/.test(node.raw)),
+    FunctionDeclarationStatement: node => Array.isArray(node.attributes) && node.attributes.length > 0,
+    LocalFunctionStatement: node => Array.isArray(node.attributes) && node.attributes.length > 0,
 }
 
 function validLua51(name: string, code: string): void {
@@ -217,6 +219,14 @@ await lowers("destructuring what a call returns reads it once",
 // --- array destructuring ---------------------------------------------------------
 await lowers("arrays read by index", "const [first, second] = list", "local first, second = list[1], list[2];")
 await lowers("holes are skipped", "const [, second] = list", "local second = list[2];")
+// A method the value's metatable gives it is called with `.`, the value its
+// `self`, and `.length` counts as `#` did.
+await lowers("methods read with `.`, and length",
+    "const s = \"abc\"\nprint(s.upper(s), s.length, \"ab\".length)",
+    "local s = \"abc\"; print(s.upper(s), #s, #\"ab\");")
+await lowers("a function a table holds is called as it is",
+    "const t = { f: (n: number) => n }\nprint(t.f(1))",
+    "local t = { f = function(n) return n; end }; print((t.f(1)));")
 await lowers("array rest", "const [head, ...tail] = list", "local head = list[1]; local tail = table.move(list, 2, #list, 1, {});")
 
 // --- destructuring assignment ----------------------------------------------------
@@ -732,7 +742,7 @@ function fails(name: string, result: BundleResult, message: string): void {
             `let a = 1`,
             `let b = 2`,
             `{ a, b } = { a: b, b: a }`,
-            `print(\`\${x} \${py} \${count} \${first} \${third} \${#tail} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...scriptArgs)`,
+            `print(\`\${x} \${py} \${count} \${first} \${third} \${tail.length} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...scriptArgs)`,
         ].join("\n"),
         "stack.tilua": [
         "export const Stack = {}",
@@ -744,7 +754,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         "    table.insert(self.items, value)",
         "}",
         "function Stack:size(): number {",
-        "    return #self.items",
+        "    return self.items.length",
         "}",
         "",
         "",
@@ -1007,7 +1017,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         "    let EventManager = {",
         "        Connections: [1, 2],",
         "        Count: function() {",
-        "            return #EventManager.Connections",
+        "            return EventManager.Connections.length",
         "        }",
         "    }",
         "    return EventManager",
@@ -1084,7 +1094,7 @@ await lowers("a spread array literal in an array is its values",
 {
     const lowered = await compile([
         "const names = [\"a\", \"bb\"]",
-        "const long = names:filter(n => #n > 1)",
+        "const long = names:filter(n => n.length > 1)",
         "const up = (\"x\"):upper()",
         "const trimmed = (\" x \"):trim()",
         "const keys = { b: 1, a: 2 }:keys()",
@@ -1183,6 +1193,23 @@ await lowers("`scriptArgs` is the script's own `...`, as an array",
         code.includes("local found = tilua_result.find(\"abc\", \"b\");"),
         code.includes("local finder = tilua_result.find;"),
     ], [true, true, true, true])
+}
+
+// Lua's standard library is always there, so is how it runs: `pcall` answers
+// one value and `console:log` says where it was called, with no type library
+// named — and with `noLib`, neither.
+{
+    const program = parseTilua("declare function load(): number\nconst result = pcall(load)\nconsole:log(result)\n")
+    const scopes = analyzeScopesTilua(program)
+    const lowered = (noLib: boolean): string => flat(printLuau(luau.program(lower(program, scopes, {
+        types: analyzeTypesTilua(program, scopes, { noLib }), noLib, file: "src/a.tilua",
+    }).statements)))
+    const standard = lowered(false)
+    check("standard library: lowered with no library named", [
+        standard.includes("local result = tilua_result.pcall(load);"),
+        standard.includes('tilua_console.log("[src/a:3]:", nil, result);'),
+    ], [true, true])
+    check("standard library: `noLib` leaves it out", lowered(true), "local result = pcall(load); console:log(result);")
 }
 
 // A rest parameter is Lua's `{...}` under a name: the function still takes
@@ -1525,7 +1552,7 @@ await lowersMarked("typeof: an array is written down as one where it is made",
             "print(name(scriptArgs))",
             "const v: unknown = xs",
             "if (typeof v == \"array\") {",
-            "    print(#v)",
+            "    print(v.length)",
             "}",
         ].join("\n"),
     })
@@ -1542,6 +1569,312 @@ await lowersMarked("typeof: an array is written down as one where it is made",
         "array",
         "2",
     ])
+}
+
+// --- import() and output in several files -----------------------------------------
+//
+// `import("./x")` is the bundle's `import`, a wrapper around its `require`. With
+// `output` the bundle is more than one file, and `require` loads the file a
+// module is in the first time it is asked for — so these are run from disk,
+// written as the bundler names them. `LUA51` naming a Lua 5.1 interpreter runs
+// each of them built for that target as well.
+
+/** Write every file of `result` where it says, and run the entry's. */
+function runFiles(name: string, result: BundleResult, binary: string | undefined): string[] | undefined {
+    if (result.code === undefined) {
+        failures.push(`${name}\n    no bundle: ${result.diagnostics.map(d => `${d.line}:${d.column} ${d.message}`).join("; ")}`)
+        return undefined
+    }
+    for (const file of result.files) validLuau(`${name} (${file.path})`, file.code)
+    if (!binary) {
+        skipped++
+        return undefined
+    }
+    const folder = mkdtempSync(join(tmpdir(), "tilua-files-"))
+    for (const file of result.files) {
+        mkdirSync(dirname(join(folder, file.path)), { recursive: true })
+        writeFileSync(join(folder, file.path), file.code)
+    }
+    const entryFile = join(folder, result.files[0].path)
+    try {
+        // From the entry's own folder: Luau reads a `require`d path from the
+        // file that asks, and names that file from where it was started.
+        return execFileSync(binary, [basename(entryFile)], { encoding: "utf8", stdio: "pipe", cwd: dirname(entryFile) }).trim().split(/\r?\n/)
+    } catch (error) {
+        const { stdout, stderr } = error as { stdout?: string; stderr?: string }
+        return `${stdout ?? ""}\n${stderr ?? ""}`.trim().split(/\r?\n/)
+    }
+}
+
+{
+    const files = {
+        "tilua.config.json": JSON.stringify({ types: [] }),
+        "src/main.tilua": [
+            `import { clamp } from "./util"`,
+            `print("main", clamp(5, 0, 3))`,
+            `function open() {`,
+            `    const shop = import("./shop/buy")`,
+            `    print("price", shop.price("hat"), shop.default)`,
+            `    return shop`,
+            `}`,
+            `print("same", open() == import("./shop/buy"))`,
+            `print(import("./extra").describe())`,
+            `import("./side")`,
+            `print(import("./util").clamp(-4, 0, 3), scriptArgs.length)`,
+        ].join("\n"),
+        "src/util.tilua": `export function clamp(x: number, lo: number, hi: number): number {\n    if (x < lo) { return lo }\n    if (x > hi) { return hi }\n    return x\n}\n`,
+        "src/shop/buy.tilua": `import { clamp } from "../util"\nimport { tax } from "./tax"\nprint("buy loaded")\nexport function price(name: string): number {\n    return clamp(name.length * 10, 0, 25) + tax()\n}\nexport default "shop"\n`,
+        "src/shop/tax.tilua": `print("tax loaded")\nexport function tax(): number { return 2 }\n`,
+        "src/extra.tilua": `import { tax } from "./shop/tax"\nexport function describe(): string {\n    return \`extra \${tax()}\`\n}\n`,
+        "src/side.tilua": `print("side", scriptArgs.length)\n`,
+    }
+    const root = project(files)
+    const entry = join(root, "src/main.tilua")
+    const expected = ["main\t3", "tax loaded", "buy loaded", "price\t27\tshop", "same\ttrue", "extra 2", "side\t0", "0\t0"]
+
+    const single = await bundle({ entry })
+    check("import(): one file by default", single.files.map(f => f.path), ["main.luau"])
+    check("import(): the bundle's import, called with the module's name",
+        single.code?.includes(`G.import("src/shop/buy")`) && single.code.includes("import = function(name)"), true)
+    check("import(): a statement of its own still loads the module", single.code?.includes(`G.import("src/side");`), true)
+    runs("import(): loads a module when it runs, once", single, expected)
+
+    const plain = await bundle({ entry: join(project({ "main.tilua": `import { a } from "./a"\nprint(a)\n`, "a.tilua": `export const a = 1\n` }), "main.tilua"), config: { types: [] } })
+    check("import(): a bundle that writes none has no wrapper", plain.code?.includes("import = function"), false)
+
+    const chunks = await bundle({ entry, output: "chunks", outFile: "game.luau" })
+    check("chunks: what only an import() reaches gets a file, and what two share another",
+        chunks.files.map(f => [f.path, f.modules]), [
+            ["game.luau", ["src/main", "src/util"]],
+            ["game_src_shop_buy.luau", ["src/shop/buy"]],
+            ["game_src_extra.luau", ["src/extra"]],
+            ["game_src_side.luau", ["src/side"]],
+            ["game_shared.luau", ["src/shop/tax"]],
+        ])
+    check("chunks: the entry's file says where the others are",
+        chunks.code?.includes(`["src/shop/tax"] = "./game_shared"`), true)
+    check("chunks: every other file is a function over the bundle's table",
+        chunks.files[1]?.code.startsWith("return function(G)"), true)
+    check("chunks: the same program", runFiles("chunks: the same program", chunks, luauBinary) ?? expected, expected)
+
+    const modules = await bundle({ entry, output: "modules" })
+    check("modules: a file for each, in the project's tree", modules.files.map(f => f.path),
+        ["src/main.luau", "src/util.luau", "src/shop/buy.luau", "src/extra.luau", "src/side.luau", "src/shop/tax.luau"])
+    check("modules: named from the entry's own file", modules.code?.includes(`["src/shop/tax"] = "./shop/tax"`), true)
+    check("modules: the same program", runFiles("modules: the same program", modules, luauBinary) ?? expected, expected)
+
+    const configured = await bundle({ entry: join(project({ ...files, "tilua.config.json": JSON.stringify({ types: [], output: "chunks" }) }), "src/main.tilua") })
+    check("output: the config's, without an option", configured.files.length, 5)
+
+    const lua51Binary = process.env.LUA51
+    for (const output of ["single", "chunks", "modules"] as const) {
+        const built = await bundle({ entry, output, target: "lua51" })
+        check(`lua51: ${output}, loaded with loadfile`, output === "single" || built.code?.includes("loadfile(folder .. file)"), true)
+        if (lua51Binary) check(`lua51: ${output} runs`, runFiles(`lua51: ${output} runs`, built, lua51Binary), expected)
+    }
+}
+
+// An error in a file that is not the entry's is still reported in the project's.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [] }),
+        "src/main.tilua": `function boom() {\n    import("./shop/broken").fail(nil)\n}\nboom()\n`,
+        "src/shop/broken.tilua": `export function fail(inner: any) {\n    return inner.value\n}\n`,
+    })
+    for (const output of ["chunks", "modules"] as const) {
+        const ran = runFiles(`${output}: an error in another file`, await bundle({ entry: join(root, "src/main.tilua"), output }), luauBinary)
+        if (ran) {
+            check(`${output}: an error in another file names the project's`, ran.slice(0, 4), [
+                "src/shop/broken.tilua:2: attempt to index nil with 'value'",
+                "    at src/shop/broken.tilua:2 (fail)",
+                "    at src/main.tilua:2 (boom)",
+                "    at src/main.tilua:4 (load)",
+            ])
+        }
+    }
+}
+
+{
+    const root = project({
+        "main.tilua": `const name = "./a"\nconst a = import("./missing")\nconst b = import(name)\n`,
+    })
+    const result = await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })
+    check("import(): a module that is not there, and one not named by a literal",
+        [result.code, result.diagnostics.filter(d => d.category === "module").map(d => `${d.line}:${d.column} ${d.message}`)],
+        [undefined, [
+            "2:18 Cannot find module './missing'",
+            "3:18 import() takes a string literal: which module it loads is decided when the project is built",
+        ]])
+    const alone = await compile(`const a = import("./a")\n`)
+    check("import(): needs a bundle", [alone.code, alone.diagnostics.map(d => d.message)],
+        [undefined, ["import() needs a bundle: build the project with @tilua/compiler"]])
+}
+
+// --- Lua 5.1 at runtime -------------------------------------------------------------
+//
+// Valid Lua 5.1 is not yet Lua 5.1 that runs: `for _, v in list do` parses, and
+// then calls a table. So what the lowering leaves to Luau itself is looked at
+// here as text, and — with `LUA51` naming a Lua 5.1 interpreter — the same
+// program is built for both targets and has to print the same thing on each.
+{
+    // Which it is, the types say: without them every table goes the long way.
+    const program = parseTilua("const list = [1, 2]\nfor (const v in list) { print(v) }")
+    const scopes = analyzeScopesTilua(program)
+    const result = lower(program, scopes, { target: "lua51", types: analyzeTypesTilua(program, scopes) })
+    check("lua51: an array is walked with ipairs", unmarked(flat(printLuau(luau.program(result.statements)))),
+        "local list = { 1, 2 }; for _, v in ipairs(list) do print(v); end;")
+}
+lowers51("lua51: any other table is walked as Luau would walk it", "declare t: { [string]: number }\nfor (const v in t) { print(v) }",
+    "local function tilua_each(source, ...) if type(source) == \"function\" then return source, ...; end; "
+    + "local meta = getmetatable(source); if meta ~= nil and meta.__iter ~= nil then return meta.__iter(source); end; "
+    + "return next, source; end; for _, v in tilua_each(t) do print(v); end;")
+lowers51("lua51: an optional read is a call, not an `if` expression", "declare a: { b: boolean } | nil\nconst v = a?.b",
+    "local v = (function() local ref = a; if ref == nil then return nil; end; return ref.b; end)();")
+lowers51("lua51: attributes are Luau's, and are dropped", "@native\nfunction f(x: number) { return x }", "local function f(x) return x; end;")
+lowers51("lua51: a rest element is copied without table.move", "declare list: number[]\nconst [head, ...tail] = list",
+    "local function tilua_move(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; "
+    + "local head = list[1]; local tail = tilua_move(list, 2, #list, 1, {});")
+lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[]) => nil\ndeclare xs: number[]\nf(1, ...xs)", "f(1, unpack(xs));")
+
+{
+    const root = project({
+        "main.tilua": [
+            `import { Stack } from "./stack"`,
+            `type Point = { x: number, y: number }`,
+            `const point: Point = { x: 1, y: 2 }`,
+            `const { x, y: py = 9, ...others } = { ...point, z: 3, w: 4 }`,
+            `let count = 0`,
+            `for (const value in others) { count += value }`,
+            `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
+            `function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number {`,
+            `    return (a + b) * scale`,
+            `}`,
+            `const values = [0, ...[1, 2], sum({ a: 1 }), sum({ a: 1, b: 1 }, 2)]`,
+            `let total = 0`,
+            `for (const v in values) {`,
+            `    if (v == 2) { continue }`,
+            `    total += v`,
+            `}`,
+            `const stack = Stack.new()`,
+            `stack:push(5)`,
+            `const label = if total > 10 then "big" else "small"`,
+            `const flags: { on: boolean } | nil = { on: false }`,
+            `const none: { on: boolean } | nil = nil`,
+            `function steps(limit: number) {`,
+            `    let at = 0`,
+            `    return () => {`,
+            `        at += 1`,
+            `        return if at <= limit then at else nil`,
+            `    }`,
+            `}`,
+            `let stepped = 0`,
+            `for (const step in steps(3)) { stepped += step }`,
+            `@native`,
+            `function half(n: number): number { return n // 2 }`,
+            `function all(...parts: number[]): number { return parts.length }`,
+            `print(\`\${x} \${py} \${count} \${first} \${third} \${tail.length} \${total} \${label} \${stack:size()}\`)`,
+            `print(flags?.on, none?.on, stepped, half(7), 1_000, all(...values), all(0, ...tail:map(v => v.length)))`,
+            `print([3, 1, 2]:reverse():concat([9], [8]):slice(2, 4):join("-"), [[1], [2, 3]]:flat():join(""), typeof values, typeof point)`,
+        ].join("\n"),
+        "stack.tilua": [
+            "export const Stack = {}",
+            "Stack.__index = Stack",
+            "function Stack.new() {",
+            "    return setmetatable({ items: [] }, Stack)",
+            "}",
+            "function Stack:push(value: number) {",
+            "    table.insert(self.items, value)",
+            "}",
+            "function Stack:size(): number {",
+            "    return self.items.length",
+            "}",
+            "",
+        ].join("\n"),
+    })
+    const entry = join(root, "main.tilua")
+    const forLuau = await bundle({ entry, config: { types: [] } })
+    const forLua51 = await bundle({ entry, config: { types: [] }, target: "lua51" })
+    if (forLua51.code !== undefined) validLua51("lua51: the language at runtime", forLua51.code)
+    const expected = run("lua51: the same program, for Luau", forLuau)
+    const lua51Binary = process.env.LUA51
+    if (expected && lua51Binary) {
+        check("lua51: the language at runtime prints what Luau prints", runFiles("lua51: the language at runtime", forLua51, lua51Binary), expected)
+    }
+}
+
+// `??`, `n++` / `n--`, `in`, `instanceof`, interfaces and object accessors:
+// TypeScript's, at runtime.
+{
+    const root = project({
+        "main.tilua": [
+            "interface Named {",
+            "    name: string",
+            "    greet(): string",
+            "}",
+            "class Animal implements Named {",
+            "    name: string",
+            "    constructor(name: string) { this.name = name }",
+            "    function greet(): string { return `I am ${this.name}` }",
+            "}",
+            "class Dog extends Animal {",
+            "    constructor(name: string) { super(name) }",
+            "}",
+            "class Cat { constructor() {} }",
+            "export type { Named }",
+            "const off: boolean | nil = false",
+            "const none: number | nil = nil",
+            "function pick(): number | nil { return nil }",
+            "print(off ?? true, none ?? 2, pick() ?? 3, (off or true))",
+            "let n = 0",
+            "n++",
+            "n++",
+            "n--",
+            "const counts = { hits: 1 }",
+            "counts.hits++",
+            "const xs = [5]",
+            "xs[1]--",
+            "print(n, counts.hits, xs[1])",
+            "const shape: { radius?: number, side?: number } = { radius: 2 }",
+            "print(\"radius\" in shape, \"side\" in shape)",
+            "const rex = Dog.new(\"Rex\")",
+            "const items: (Animal | Cat | string)[] = [rex, Cat.new(), \"x\"]",
+            "print(rex instanceof Dog, rex instanceof Animal, rex instanceof Cat, items[2] instanceof Animal, items[3] instanceof Animal)",
+            "const named: Named = rex",
+            "print(named:greet())",
+            "const person = {",
+            "    first: \"Ada\",",
+            "    last: \"Lovelace\",",
+            "    get full(): string { return `${this.first} ${this.last}` },",
+            "    set full(value: string) { this.first = value },",
+            "    get initial(): string { return this.first:sub(1, 1) },",
+            "}",
+            "print(person.full, person.initial)",
+            "person.full = \"Grace\"",
+            "print(person.full, person.first)",
+            "const written = pcall(() => { (person as any).initial = \"z\" })",
+            "print(written.success, tostring(written.error))",
+            "",
+        ].join("\n"),
+    })
+    const entry = join(root, "main.tilua")
+    const result = await bundle({ entry, config: { types: [] } })
+    const expected = [
+        "false\t2\t3\ttrue",
+        "1\t2\t4",
+        "true\tfalse",
+        "true\ttrue\tfalse\tfalse\tfalse",
+        "I am Rex",
+        "Ada Lovelace\tA",
+        "Grace Lovelace\tGrace",
+    ]
+    const output = run("bundle: TypeScript's operators, interfaces and accessors", result)
+    if (output) {
+        check("bundle: TypeScript's operators, interfaces and accessors", output.slice(0, expected.length), expected)
+        check("bundle: a getter with no setter cannot be written", output[expected.length]?.startsWith("false\t") && output[expected.length].includes("has a getter and no setter"), true)
+    }
+    const forLua51 = await bundle({ entry, config: { types: [] }, target: "lua51" })
+    if (forLua51.code !== undefined) validLua51("lua51: TypeScript's operators, interfaces and accessors", forLua51.code)
+    else failures.push(`lua51: TypeScript's operators, interfaces and accessors\n    no bundle: ${forLua51.diagnostics.map(d => d.message).join("; ")}`)
 }
 
 for (const failure of failures) console.log(`FAIL ${failure}`)

@@ -38,13 +38,33 @@
  *   - Imports are read through the exporting module's table, so they are live;
  *     so are re-exports (`links`) and `export *` (`stars`), which the table
  *     looks up in the other module on every read.
+ *   - `import("./x")` is `G.import("src/x")`, a wrapper around that same
+ *     `require`: the module's exports table, asked for where the code runs.
+ *
+ * A project -> several Luau files (`output`).
+ *
+ * The table does not have to be filled by one file. The entry's file holds the
+ * runtime and some of the modules; every other file is a function that adds
+ * its modules to the table it is handed:
+ *
+ *   return function(G)
+ *       G.modules["src/shop"] = { load = function(exports) ... end }
+ *   end
+ *
+ * `G.files` says which file each of those modules is in, and `require` loads
+ * that file — once — the first time one of its modules is asked for. How a
+ * file is loaded is the target's: Luau's `require` by path, or Lua 5.1's
+ * `loadfile`, both from beside the entry's file. `"chunks"` keeps everything
+ * the entry imports in the entry's file and splits off what only an
+ * `import()` reaches; `"modules"` gives every module a file of its own.
  */
 import { readFileSync, statSync } from "node:fs"
-import { dirname, relative, resolve } from "node:path"
+import { basename, dirname, extname, posix, relative, resolve } from "node:path"
 import {
-    parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries,
+    parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries, importExpressions,
     directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, ParseError, LexError, luauString,
     type ModuleExports, type Program, type ScopeAnalysis, type TiluaConfig, type TypeAnalysis, type Directives,
+    type OutputMode,
 } from "@tilua/parser"
 import { parse as parseLuau, parseExpressionFromSource, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
@@ -67,6 +87,24 @@ export interface BundleOptions {
     readonly typeCheck?: boolean
     /** Which Lua the output must run on. Overrides the config's `target`. */
     readonly target?: Target
+    /** How many files to make. Overrides the config's `output`; `"single"`
+     *  without either. */
+    readonly output?: OutputMode
+    /** What the entry's file is called: `main.luau`. The other files of
+     *  `"chunks"` are named after it (`main_shop.luau`), and every file takes
+     *  its extension. Default: the entry's own name, with `.luau`. */
+    readonly outFile?: string
+}
+
+/** One file of the output. */
+export interface BundleFile {
+    /** Where it goes, from the folder the output is written to: `main.luau`,
+     *  `src/shop/buy.luau`. Files find each other by these, so they have to be
+     *  written as they are named. */
+    readonly path: string
+    readonly code: string
+    /** The modules in it, by name. */
+    readonly modules: string[]
 }
 
 export interface BundleDiagnostic {
@@ -82,9 +120,13 @@ export interface BundleDiagnostic {
 }
 
 export interface BundleResult {
-    /** The bundle, or `undefined` when a module could not be compiled. Type
-     *  errors are reported but do not stop it. */
+    /** The bundle — the entry's file, when there are several — or `undefined`
+     *  when a module could not be compiled. Type errors are reported but do
+     *  not stop it. */
     readonly code?: string
+    /** Every file of the output, the entry's first. Empty when there is no
+     *  bundle. */
+    readonly files: BundleFile[]
     /** The bundled modules' names, entry first. */
     readonly modules: string[]
     readonly diagnostics: BundleDiagnostic[]
@@ -118,14 +160,16 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         const file = queue.shift()!
         if (sources.has(file)) continue
         const parsed = parseFile(file, diagnostics, directives)
-        if (!parsed) return { modules: [], diagnostics }
+        if (!parsed) return { files: [], modules: [], diagnostics }
         const { program, text } = parsed
-        const scopes = analyzeScopes(program)
+        const scopes = analyzeScopes(program, { noLib: config?.noLib })
         for (const d of scopes.diagnostics) {
             diagnostics.push({ file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "scope" })
         }
         sources.set(file, { file, name: nameOf(file), text, program, scopes })
-        for (const specifier of importedSpecifiers(program)) {
+        // What an `import()` names is part of the project too.
+        const dynamic = importExpressions(program).flatMap(node => (node.source.type === "StringLiteral" ? [node.source.value] : []))
+        for (const specifier of [...importedSpecifiers(program), ...dynamic]) {
             const target = resolveModulePath(file, specifier, config)
             if (target && !target.endsWith(".d.tilua")) queue.push(target)
         }
@@ -148,13 +192,10 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const names = Names.from(...[...sources.values()].map(s => s.program))
     const G = names.fresh("G")
     const requireExpression = luau.member(luau.identifier(G), "require")
-    const modules = new Map<string, {
-        name: string
-        statements: LuauStatement[]
-        exportsName: string
-        info: ModuleInfo
-        usesScriptArgs: boolean
-    }>()
+    const importExpression = luau.member(luau.identifier(G), "import")
+    const mode: OutputMode = options.output ?? config?.output ?? "single"
+    const target: Target = options.target ?? config?.target ?? "luau"
+    const modules = new Map<string, LoweredModule>()
     // Where every emitted statement was written, across all the modules. The
     // bundle is one file, so this is the only way back to the project.
     const origins = new WeakMap<LuauStatement, Origin>()
@@ -164,24 +205,32 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         if (modules.has(file)) continue
         const source = sources.get(file)!
         const shown = relative(root, file).replace(/\\/g, "/")
+        const imports = new Set<string>()
+        const dynamicImports = new Set<string>()
         const lowered = lower(source.program, source.scopes, {
             names,
             types: analysis.types.get(file),
             lowerings,
-            target: options.target ?? config?.target,
+            target,
+            noLib: config?.noLib,
             source: source.text,
             file: shown,
             module: {
                 name: source.name,
                 require: requireExpression,
-                lines: `${G}.lines`,
+                import: importExpression,
+                // One file has one line map. Several have one each, and a
+                // module reads the one of the file it is in.
+                lines: mode === "single" ? `${G}.lines` : `${G}.maps[${luauString(source.name)}]`,
                 fail: `${G}.fail`,
                 arrays: `${G}.arrays`,
-                resolve: specifier => {
-                    const target = resolveModulePath(file, specifier, config)
-                    if (!target || target.endsWith(".d.tilua") || !sources.has(target)) return undefined
-                    pending.push(target)
-                    return sources.get(target)!.name
+                resolve: (specifier, dynamic) => {
+                    const found = resolveModulePath(file, specifier, config)
+                    if (!found || found.endsWith(".d.tilua") || !sources.has(found)) return undefined
+                    pending.push(found)
+                    const name = sources.get(found)!.name
+                    ;(dynamic ? dynamicImports : imports).add(name)
+                    return name
                 },
             },
         })
@@ -196,6 +245,8 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
             exportsName: lowered.exportsName,
             info: lowered.module,
             usesScriptArgs: lowered.usesScriptArgs,
+            imports,
+            dynamicImports,
         })
     }
 
@@ -221,37 +272,42 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     diagnostics.length = 0
     diagnostics.push(...reported)
 
-    const moduleNames = [...modules.values()].map(m => m.name)
+    const lowered = [...modules.values()]
+    const moduleNames = lowered.map(m => m.name)
     if (diagnostics.some(d => d.category === "syntax" || d.category === "scope" || d.category === "module")) {
-        return { modules: moduleNames, diagnostics }
+        return { files: [], modules: moduleNames, diagnostics }
     }
 
-    const program = parseLuau(runtime(G))
+    const several = mode !== "single"
+    const layout = layoutOf(mode, modules.get(entry)!, lowered, options.outFile)
+    const usesScriptArgs = lowered.some(m => m.usesScriptArgs)
+    /** What `load` is handed for each module that is not in the entry's file. */
+    const elsewhere = new Map<string, string>()
+    for (const file of layout.slice(1)) {
+        for (const module of file.modules) elsewhere.set(module.name, loadPath(layout[0].path, file.path, target))
+    }
+
+    const program = parseLuau(runtime(G, {
+        several,
+        target,
+        files: elsewhere,
+        imports: lowered.some(m => m.dynamicImports.size > 0),
+    }))
     const assignment = program.body.statements[1]
     // `scriptArgs` is what the bundle was started with — the chunk's own
     // `...` — and every module reaches it, so it comes before them all.
-    if ([...modules.values()].some(m => m.usesScriptArgs)) {
+    if (usesScriptArgs) {
         program.body.statements.unshift(luau.local(["scriptArgs"], [luau.table([{ type: "TableFieldPositional", value: { type: "VarargExpression" } as never }])]))
         program.body.statements.push(...parseLuau(`${G}.arrays[scriptArgs] = true`).body.statements)
+        // A module in another file has no way to the entry's locals.
+        if (several) program.body.statements.push(...parseLuau(`${G}.scriptArgs = scriptArgs`).body.statements)
     }
     const modulesTable = assignment.type === "AssignmentStatement" && assignment.values[0].type === "TableExpression"
         ? (assignment.values[0].fields.find(f => f.type === "TableFieldNamed" && f.name.name === "modules") as { value: TableExpression } | undefined)?.value
         : undefined
     if (!modulesTable) throw new Error("@tilua/compiler: the bundle runtime has no modules table")
-    for (const module of modules.values()) {
-        const { names: exported, links, stars } = module.info
-        const fields: TableField[] = []
-        if (exported.length) fields.push(luau.field("names", luau.table(exported.map(n => luau.field(n, luau.boolean(true))))))
-        if (links.length) {
-            fields.push(luau.field("links", luau.table(links.map(link => luau.field(link.name, luau.table([
-                { type: "TableFieldPositional", value: luau.string(link.module) },
-                ...(link.imported === undefined ? [] : [{ type: "TableFieldPositional" as const, value: luau.string(link.imported) }]),
-            ]))))))
-        }
-        if (stars.length) fields.push(luau.field("stars", luau.table(stars.map(star => ({ type: "TableFieldPositional", value: luau.string(star) })))))
-        // Vararg, so a top-level `...` is still valid Luau.
-        fields.push(luau.field("load", luau.functionExpression(luau.functionBody([module.exportsName], module.statements, true))))
-        modulesTable.fields.push({ type: "TableFieldComputed", key: luau.string(module.name), value: luau.table(fields) })
+    for (const module of layout[0].modules) {
+        modulesTable.fields.push({ type: "TableFieldComputed", key: luau.string(module.name), value: moduleTable(module) })
     }
     // The entry runs under `xpcall`, so an error nothing caught — `nil.x`, an
     // `error` of the author's — is reported in the project's files rather than
@@ -273,18 +329,202 @@ ${modules.get(entry)!.info.exports ? `return ${result}` : ""}
     // text exists. Its own assignment then goes in immediately before the entry
     // runs — after every module body, so nothing the map describes moves.
     const map = buildLineMap(program, parseLuau(print(program)), origins)
-    if (map.size) {
-        program.body.statements.splice(program.body.statements.length - entryStatements.length, 0, luau.assign(
+    if (map.size || several) {
+        const mapStatements: LuauStatement[] = [luau.assign(
             [luau.member(luau.identifier(G), "lines")],
             [parseExpressionFromSource(lineMapSource(map))],
-        ))
+        )]
+        if (several) mapStatements.push(...mapRegistration(G, layout[0], `${G}.lines`))
+        program.body.statements.splice(program.body.statements.length - entryStatements.length, 0, ...mapStatements)
     }
 
-    return { code: print(program) + "\n", modules: moduleNames, diagnostics }
+    const files: BundleFile[] = [{ path: layout[0].path, code: print(program) + "\n", modules: layout[0].modules.map(m => m.name) }]
+    for (const file of layout.slice(1)) {
+        // Every other file: a function that adds its modules to the table it
+        // is handed. It has no locals of its own for a module to trip over.
+        const body: LuauStatement[] = []
+        if (file.modules.some(m => m.usesScriptArgs)) body.push(...parseLuau(`local scriptArgs = ${G}.scriptArgs`).body.statements)
+        for (const module of file.modules) {
+            body.push(luau.assign(
+                [luau.index(luau.member(luau.identifier(G), "modules"), luau.string(module.name))],
+                [moduleTable(module)],
+            ))
+        }
+        const chunk = luau.program([luau.returns([luau.functionExpression(luau.functionBody([G], body))])])
+        // As in the entry's file: the map goes after everything it describes.
+        const lines = buildLineMap(chunk, parseLuau(print(chunk)), origins)
+        body.push(...mapRegistration(G, file, lineMapSource(lines)))
+        files.push({ path: file.path, code: print(chunk) + "\n", modules: file.modules.map(m => m.name) })
+    }
+
+    return { code: files[0].code, files, modules: moduleNames, diagnostics }
+}
+
+/** A module, lowered, and the modules it reaches. */
+interface LoweredModule {
+    readonly name: string
+    readonly statements: LuauStatement[]
+    readonly exportsName: string
+    readonly info: ModuleInfo
+    readonly usesScriptArgs: boolean
+    /** Modules it needs before it can run: `import`, `export ... from`. */
+    readonly imports: Set<string>
+    /** Modules an `import()` in it names: needed when that runs, if it does. */
+    readonly dynamicImports: Set<string>
+}
+
+/** A file of the output, before it is written out as Luau. */
+interface OutputFile {
+    readonly path: string
+    readonly modules: LoweredModule[]
+}
+
+/** A module as the bundle's table holds it: what `require` needs to know
+ *  about its exports, and `load`, which runs it. */
+function moduleTable(module: LoweredModule): TableExpression {
+    const { names: exported, links, stars } = module.info
+    const fields: TableField[] = []
+    if (exported.length) fields.push(luau.field("names", luau.table(exported.map(n => luau.field(n, luau.boolean(true))))))
+    if (links.length) {
+        fields.push(luau.field("links", luau.table(links.map(link => luau.field(link.name, luau.table([
+            { type: "TableFieldPositional", value: luau.string(link.module) },
+            ...(link.imported === undefined ? [] : [{ type: "TableFieldPositional" as const, value: luau.string(link.imported) }]),
+        ]))))))
+    }
+    if (stars.length) fields.push(luau.field("stars", luau.table(stars.map(star => ({ type: "TableFieldPositional", value: luau.string(star) })))))
+    // Vararg, so a top-level `...` is still valid Luau.
+    fields.push(luau.field("load", luau.functionExpression(luau.functionBody([module.exportsName], module.statements, true))))
+    return luau.table(fields)
+}
+
+/**
+ * Which file each module goes in. The entry's file is first.
+ *
+ * `"chunks"`: a module the entry reaches through `import` statements alone is
+ * needed before anything runs, and stays in the entry's file. Every other
+ * module is there because some `import()` leads to it, and goes with the
+ * `import()`s that do: the modules one alone reaches are its file, and the
+ * ones several share are a file of their own, so nothing is written twice and
+ * nothing is loaded before one of them is asked for.
+ */
+function layoutOf(mode: OutputMode, entry: LoweredModule, modules: readonly LoweredModule[], outFile: string | undefined): OutputFile[] {
+    const extension = (outFile !== undefined && extname(outFile)) || ".luau"
+    const entryStem = outFile !== undefined ? basename(outFile, extname(outFile)) : posix.basename(entry.name)
+    const others = modules.filter(m => m !== entry)
+
+    if (mode === "single") return [{ path: `${entryStem}${extension}`, modules: [entry, ...others] }]
+
+    if (mode === "modules") {
+        // The project's own tree. A module above the project folder has no
+        // place in it, so each `..` on the way to it becomes a folder.
+        const pathOf = (m: LoweredModule): string => `${m.name.split("/").map(part => (part === ".." ? "__" : part)).join("/")}${extension}`
+        return [entry, ...others].map(m => ({ path: pathOf(m), modules: [m] }))
+    }
+
+    const byName = new Map(modules.map(m => [m.name, m]))
+    const reach = (root: string): Set<string> => {
+        const seen = new Set<string>()
+        const stack = [root]
+        while (stack.length) {
+            const name = stack.pop()!
+            if (seen.has(name)) continue
+            seen.add(name)
+            stack.push(...(byName.get(name)?.imports ?? []))
+        }
+        return seen
+    }
+    const inEntry = reach(entry.name)
+    const roots = [...new Set(modules.flatMap(m => [...m.dynamicImports]))].filter(root => !inEntry.has(root))
+    const reached = new Map(roots.map(root => [root, reach(root)]))
+    const groups = new Map<string, { roots: string[]; modules: LoweredModule[] }>()
+    for (const module of others) {
+        if (inEntry.has(module.name)) continue
+        const by = roots.filter(root => reached.get(root)!.has(module.name))
+        const key = by.join("\n")
+        if (!groups.has(key)) groups.set(key, { roots: by, modules: [] })
+        groups.get(key)!.modules.push(module)
+    }
+
+    const files: OutputFile[] = [{ path: `${entryStem}${extension}`, modules: modules.filter(m => inEntry.has(m.name)) }]
+    const taken = new Set([entryStem])
+    for (const group of groups.values()) {
+        // Named for the `import()` that reaches it, when there is only one.
+        const label = group.roots.length === 1 ? group.roots[0].replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "chunk" : "shared"
+        let stem = `${entryStem}_${label}`
+        for (let n = 2; taken.has(stem); n++) stem = `${entryStem}_${label}_${n}`
+        taken.add(stem)
+        files.push({ path: `${stem}${extension}`, modules: group.modules })
+    }
+    return files
+}
+
+/** What the entry's `load` is handed to load `file`: where it is from the
+ *  entry's own file, as the target's loader names a file. */
+function loadPath(entryPath: string, file: string, target: Target): string {
+    const path = posix.relative(posix.dirname(entryPath), file)
+    // Lua 5.1 reads the file itself, so it is named in full.
+    if (target === "lua51") return path
+    // Luau's `require` takes a path that says where it starts and has no extension.
+    const bare = path.slice(0, path.length - posix.extname(path).length)
+    return bare.startsWith("../") ? bare : `./${bare}`
+}
+
+/** Statements that hand a file's line map — `map`, as Luau — to the bundle:
+ *  under the file's own name, for an error's position to be read by, and under
+ *  each of its modules, for a library's runtime in one of them. */
+function mapRegistration(G: string, file: OutputFile, map: string): LuauStatement[] {
+    // The file's name, a folder at a time and without its extension: what an
+    // error's position is matched against, since the Lua running the file may
+    // call it `C:\out\src\shop.luau`, `./shop` or `ReplicatedStorage.out.src.shop`.
+    const extension = posix.extname(file.path)
+    const parts = file.path.slice(0, file.path.length - extension.length).split(/[/.]/).filter(part => part !== "")
+    const entry = `${G}.sources[#${G}.sources + 1]`
+    return parseLuau([
+        `${entry} = { { ${parts.map(luauString).join(", ")} }, ${map}, ${luauString(extension.slice(1))} }`,
+        ...file.modules.map(module => `${G}.maps[${luauString(module.name)}] = ${G}.sources[#${G}.sources][2]`),
+    ].join("\n")).body.statements
+}
+
+interface RuntimeOptions {
+    /** The output is more than one file can be: `require` loads the file a
+     *  module is in, and an error's position may be in any of them. */
+    readonly several: boolean
+    readonly target: Target
+    /** What `load` is handed for each module outside the entry's file. */
+    readonly files: ReadonlyMap<string, string>
+    /** Some module writes `import()`. */
+    readonly imports: boolean
+}
+
+/** How the entry's file loads another of the output's files: the one thing
+ *  here that Luau and Lua 5.1 do not have in common. Both read it from beside
+ *  the entry's file, and both get back the function the file is. */
+function loader(G: string, target: Target): string {
+    if (target === "lua51") {
+        return `
+        -- From beside this file, wherever that is: its own path says where.
+        local folder = ""
+        if debug ~= nil and debug.getinfo ~= nil then
+            local at = debug.getinfo(${G}.load, "S").source
+            if at:sub(1, 1) == "@" then
+                folder = at:match("^@(.*[/\\\\])") or ""
+            end
+        end
+        local chunk, problem = loadfile(folder .. file)
+        if chunk == nil then
+            error(problem, 0)
+        end
+        chunk()(${G})`
+    }
+    // Luau's \`require\` reads a path from the file that calls it: this one.
+    return `
+        require(file)(${G})`
 }
 
 /** The module table and its `require`, around the modules. */
-function runtime(G: string): string {
+function runtime(G: string, options: RuntimeOptions): string {
+    const { several } = options
+    const files = [...options.files].map(([name, file]) => `[${luauString(name)}] = ${luauString(file)}`).join(", ")
     return `
 local ${G}
 ${G} = {
@@ -332,7 +572,7 @@ ${G} = {
             return message
         end
         local lines = ${G}.lines
-        if lines == nil then
+        if lines == nil ${several ? `and #${G}.sources == 0 ` : ""}then
             return message .. (trace or "")
         end
         -- The bundle's name, as a position in a message spells it: where this
@@ -352,6 +592,81 @@ ${G} = {
                 chunk = info.short_src
             end
         end
+${several ? `
+        -- A position in this file is read by this file's map. One in another
+        -- of the bundle's files is read by that file's: the one whose name
+        -- the position ends with, by the most folders where several do. A
+        -- message says nothing about which file it starts in, so nothing is
+        -- guessed from it here.
+        local prefix = nil
+        if chunk ~= nil then
+            prefix = chunk:gsub("%p", "%%%0")
+        end
+        local function place(line)
+            local origin = lines ~= nil and lines[tonumber(line)] or nil
+            if origin == nil then
+                return nil
+            end
+            return origin[1] .. ":" .. tostring(origin[2])
+        end
+        local function elsewhere(at, line)
+            -- Already a place in the project.
+            if at:sub(-6) == ".tilua" then
+                return nil
+            end
+            local parts = {}
+            for part in at:gmatch("[^/\\\\%.]+") do
+                parts[#parts + 1] = part
+            end
+            local map, most, tied = nil, 0, false
+            for _, source in ipairs(${G}.sources) do
+                local names = source[1]
+                local last = #parts
+                if parts[last] == source[3] then
+                    last = last - 1
+                end
+                local same = 0
+                while same < #names and same < last and names[#names - same] == parts[last - same] do
+                    same = same + 1
+                end
+                if same > most then
+                    map, most, tied = source[2], same, false
+                elseif same == most then
+                    tied = true
+                end
+            end
+            -- Two files it could as well be: a wrong place is worse than none.
+            local origin = map ~= nil and not tied and map[tonumber(line)] or nil
+            if origin == nil then
+                return nil
+            end
+            return origin[1] .. ":" .. tostring(origin[2])
+        end
+        local mapped = message
+        if prefix ~= nil then
+            mapped = mapped:gsub(prefix .. ":(%d+)", function(line)
+                return place(line)
+            end)
+        end
+        mapped = mapped:gsub("(%S+):(%d+)", elsewhere)
+        local frames = {}
+        for frame in (trace or ""):gmatch("[^\\n]+") do
+            local at = nil
+            if prefix ~= nil then
+                local line = frame:match(prefix .. ":(%d+)")
+                if line ~= nil then
+                    at = place(line)
+                end
+            end
+            if at == nil then
+                for source, line in frame:gmatch("(%S+):(%d+)") do
+                    at = elsewhere(source, line)
+                    if at ~= nil then
+                        break
+                    end
+                end
+            end
+            if at ~= nil then` : `
         if chunk == nil then
             chunk = message:match("^(.-):%d+:")
         end
@@ -373,8 +688,9 @@ ${G} = {
         for frame in (trace or ""):gmatch("[^\\n]+") do
             local line = frame:match(prefix .. ":(%d+)")
             local at = line ~= nil and place(line) or nil
-            if at ~= nil then
-                local name = frame:match("function ([%w_.:]+)")
+            if at ~= nil then`}
+                -- Luau writes \`function name\`; Lua 5.1, \`function 'name'\`.
+                local name = frame:match("function ([%w_.:]+)") or frame:match("function '([^']+)'")
                 frames[#frames + 1] = "    at " .. at .. (name ~= nil and (" (" .. name .. ")") or "")
             end
         end
@@ -383,13 +699,36 @@ ${G} = {
         end
         return mapped .. "\\n" .. table.concat(frames, "\\n")
     end,
-    records = {},
+    records = {},${several ? `
+    -- The file each module outside this one is in, as \`load\` is handed it.
+    files = { ${files} },
+    loaded = {},
+    -- Every file's line map: by the module, and by the file's name.
+    maps = {},
+    sources = {},
+    -- Another of the bundle's files: a function that adds its modules here.
+    load = function(file)
+        if ${G}.loaded[file] then
+            return
+        end
+        ${G}.loaded[file] = true${loader(G, options.target)}
+    end,` : ""}${options.imports ? `
+    -- \`import("./x")\`: the module's exports, asked for where the code runs
+    -- rather than before its module does. \`require\` does the rest — and
+    -- loads the file the module is in, if it is not this one.
+    import = function(name)
+        return ${G}.require(name)
+    end,` : ""}
     require = function(name)
         local record = ${G}.records[name]
         if record ~= nil then
             return record.exports
         end
-        local module = ${G}.modules[name]
+        local module = ${G}.modules[name]${several ? `
+        if module == nil then
+            ${G}.load(${G}.files[name])
+            module = ${G}.modules[name]
+        end` : ""}
         local initialized = {}
         local exports = setmetatable({}, {
             __index = function(_, key)
@@ -408,7 +747,7 @@ ${G} = {
                     return source[link[2]]
                 end
                 if module.stars ~= nil and key ~= "default" then
-                    for _, star in module.stars do
+                    for _, star in ipairs(module.stars) do
                         local value = ${G}.require(star)[key]
                         if value ~= nil then
                             return value
@@ -533,6 +872,8 @@ function analyzeModules(
     for (const p of libraries.problems) out.push({ file: p.file, message: p.message, line: p.line ?? 1, column: p.column ?? 1, category: "config" })
 
     const libs = libraries.files.map(parsedLibrary)
+    const noLib = config?.noLib ?? false
+    const checked = libs.length > 0 || !noLib
     const globals = libs.flatMap(lib => lib.body.statements.flatMap(s => (s.type === "DeclareStatement" ? [s.name] : [])))
 
     const byFile = new Map(modules.map(m => [m.file, m]))
@@ -563,9 +904,10 @@ function analyzeModules(
             readWhile.set(file, remembered.read)
             return remembered.result
         }
-        // Without a type library even `print` is undeclared: only check names
-        // against libraries that are there.
-        const scopes = analyzeScopes(program, { builtinGlobals: globals, reportUndeclared: libs.length > 0 })
+        // Lua's standard library is always there, so every name is checked —
+        // unless the project left it out and named no library: then even
+        // `print` is undeclared, and saying so would be noise.
+        const scopes = analyzeScopes(program, { builtinGlobals: globals, reportUndeclared: checked, noLib })
         const said: BundleDiagnostic[] = []
         // A name nothing declares is reported, but builds: in Luau it is a
         // global that reads as nil, not a program that cannot be compiled.
@@ -577,7 +919,8 @@ function analyzeModules(
         const types = analyzeTypes(program, scopes, {
             libs,
             resolveModule: resolverFor(file),
-            reportUnknownTypes: libs.length > 0,
+            noLib,
+            reportUnknownTypes: checked,
         })
         for (const d of types.diagnostics) {
             const at = d.node as { line: { start: number }; column: { start: number } }
@@ -631,10 +974,10 @@ function analyzeModules(
         }
         inProgress.add(target)
         try {
-            const scopes = analyzeScopes(program, { builtinGlobals: globals })
+            const scopes = analyzeScopes(program, { builtinGlobals: globals, noLib })
             const types = byFile.has(target)
                 ? analyzeModule(target, program).types
-                : analyzeTypes(program, scopes, { libs, resolveModule: resolverFor(target), diagnostics: false })
+                : analyzeTypes(program, scopes, { libs, noLib, resolveModule: resolverFor(target), diagnostics: false })
             const exports = moduleExports(program, scopes, types, resolverFor(target))
             exportsCache.set(target, exports)
             noteRead()

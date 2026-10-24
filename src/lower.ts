@@ -39,17 +39,22 @@ import * as luau from "./luau.js"
 import { Names } from "./names.js"
 import type { ArgumentInfo, CallSite, LoadedLowering } from "./lowering.js"
 import { languageLowering } from "./language.js"
+import { standardLowering } from "./standard.js"
 
 /** What lowering a file as a module of a bundle needs. */
 export interface ModuleContext {
     /** The bundle's name for this module. */
     readonly name: string
     /** The bundle's name for the module `specifier` imports, or `undefined`
-     *  when there is no such module (reported). */
-    resolve(specifier: string): string | undefined
+     *  when there is no such module (reported). `dynamic` says an `import()`
+     *  is asking: the module is needed when that runs, not before this one. */
+    resolve(specifier: string, dynamic?: boolean): string | undefined
     /** The bundle's `require`: an expression that, called with a module's
      *  name, returns its exports table. */
     readonly require: L.Expression
+    /** What `import("./x")` calls, with the module's name: the bundle's
+     *  wrapper around its `require`. Default: `require` itself. */
+    readonly import?: L.Expression
     /** Luau reaching the bundle's line map — what a library's runtime reads,
      *  as `__LINES__`, to name the file a frame was written in. */
     readonly lines?: string
@@ -87,6 +92,9 @@ export interface LowerOptions {
      *  lowers what Luau adds to Lua and 5.1 has no syntax for — `a += b`,
      *  `continue`, `if c then a else b` as an expression, `//`. */
     readonly target?: Target
+    /** The project leaves Lua's standard library out (`"noLib": true`), so
+     *  nothing of it is lowered either. */
+    readonly noLib?: boolean
 }
 
 /** `"luau"` is Roblox's Lua. `"lua51"` is stock Lua 5.1, which has none of
@@ -138,7 +146,7 @@ export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerO
 /** A runtime helper the output needs, emitted once at the top of the file.
  *  `assign` and `concat` are the language's own (spreads); a `lowering` is a
  *  table a type library asked for, by the key it gave it. */
-type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | { lowering: number; runtime: string }
+type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors" | { lowering: number; runtime: string }
 
 type Mode = "declare" | "assign"
 
@@ -242,7 +250,12 @@ class Lowerer {
         return luau.identifier(local)
     }
 
-    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof"): L.Identifier {
+    /** `table.move`. Lua 5.1 has none, and gets a function that does the same. */
+    private move(): L.Expression {
+        return this.lua51 ? this.helper("move") : luau.member(this.builtin("table"), "move")
+    }
+
+    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors"): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
             // `tilua_array` is the array methods' own table.
@@ -384,7 +397,11 @@ class Lowerer {
     /** The language's own lowering, then each library's, in load order. A
      *  runtime is named by its lowering's place here (`loweringRuntime`). */
     private get lowerings(): readonly LoadedLowering[] {
-        return (this.allLowerings ??= [languageLowering, ...(this.options.lowerings ?? [])])
+        return (this.allLowerings ??= [
+            languageLowering,
+            ...(this.options.noLib ? [] : [standardLowering]),
+            ...(this.options.lowerings ?? []),
+        ])
     }
 
     private allLowerings: readonly LoadedLowering[] | undefined
@@ -400,25 +417,39 @@ class Lowerer {
      *  (`console:log`), the last library loaded first. No answer leaves an
      *  ordinary Luau method call: `text:upper()` reaches Lua's own. */
     private loweredMethodCall(node: T.MethodCallExpression): { callee: string; prepend: L.Expression[]; passReceiver: boolean } | undefined {
+        return this.loweredMethod(node.method.name, this.options.types?.methodSources.get(node), node.object, node.arguments, node.method, node)
+    }
+
+    /** `loweredMethodCall`, for a method named `method` of what `object`
+     *  holds — called with `:` on it, or read off it with `.` and handed its
+     *  `self` like any other argument. `args` are the arguments after the
+     *  receiver; a read that is not called has none. */
+    private loweredMethod(
+        method: string,
+        source: TypeAnalysis["methodSources"] extends ReadonlyMap<unknown, infer S> ? S | undefined : never,
+        object: T.Expression,
+        args: readonly T.Expression[],
+        name: T.BaseNode,
+        node: T.BaseNode,
+    ): { callee: string; prepend: L.Expression[]; passReceiver: boolean } | undefined {
         const lowerings = this.lowerings
-        const source = this.options.types?.methodSources.get(node)
         const asked = source?.origin === "language" ? [0]
             : source?.origin === "library" ? lowerings.flatMap((l, i) => (l.library === source.library ? [i] : []))
             : source?.origin === "program" ? []
             : lowerings.map((_, i) => i).slice(1).reverse()
         if (!asked.some(i => lowerings[i].plugin.methodCall)) return undefined
-        const receiver = this.options.types?.typeOf.get(node.object)
-        const receiverGlobal = this.globalName(node.object)
-        const info = this.lazyArguments(node.arguments)
+        const receiver = this.options.types?.typeOf.get(object)
+        const receiverGlobal = this.globalName(object)
+        const info = this.lazyArguments(args)
         for (const i of asked) {
             const plugin = lowerings[i].plugin
             if (!plugin.methodCall) continue
             const answer = plugin.methodCall({
-                method: node.method.name,
+                method,
                 receiver,
                 receiverGlobal,
-                argumentCount: node.arguments.length,
-                at: this.callSite(node.method),
+                argumentCount: args.length,
+                at: this.callSite(name),
                 get arguments() { return info() },
                 use: runtime => this.loweringRuntime(i, runtime),
             })
@@ -501,6 +532,34 @@ class Lowerer {
         // so does `concat`: read first, so the marker is defined above them.
         const runtimes = this.runtimeDefinitions()
         if (this.helpers.has("concat")) this.helper("array")
+        if (this.helpers.has("concat")) this.move()
+        const move = this.helpers.get("move")
+        if (move) {
+            out.push(...parseLuau(`
+local function ${move}(from, first, last, at, to)
+	for i = first, last do
+		to[at + i - first] = from[i]
+	end
+	return to
+end`).body.statements)
+        }
+        const each = this.helpers.get("each")
+        if (each) {
+            // What Luau's `for _, v in t` does, for Lua 5.1: a table is
+            // walked as `next` walks it unless its metatable says how, and
+            // a function is already the iterator.
+            out.push(...parseLuau(`
+local function ${each}(source, ...)
+	if ${this.builtin("type").name}(source) == "function" then
+		return source, ...
+	end
+	local meta = ${this.builtin("getmetatable").name}(source)
+	if meta ~= nil and meta.__iter ~= nil then
+		return meta.__iter(source)
+	end
+	return ${this.builtin("next").name}, source
+end`).body.statements)
+        }
         const marker = this.helpers.get("array")
         const typeOf = this.helpers.get("typeof")
         if (marker || typeOf) {
@@ -542,6 +601,55 @@ local function ${typeOf}(value, known)
 end`).body.statements)
             }
         }
+        const instanceOf = this.helpers.get("instanceof")
+        if (instanceOf) {
+            // `v instanceof C`: `v` names its class (`ClassObject`), and
+            // each class the one it extends (`ParentClass`); `C` is on that
+            // chain or it is not. Only a table can be an instance.
+            out.push(...parseLuau(`
+local function ${instanceOf}(value, class)
+	if ${this.builtin("type").name}(value) ~= "table" then
+		return false
+	end
+	local current = value.ClassObject
+	while current ~= nil do
+		if current == class then
+			return true
+		end
+		current = current.ParentClass
+	end
+	return false
+end`).body.statements)
+        }
+        const accessors = this.helpers.get("accessors")
+        if (accessors) {
+            // An object literal with `get` / `set` members: they live in its
+            // metatable, never as keys of its own. A name with a getter and
+            // no setter cannot be written.
+            out.push(...parseLuau(`
+local function ${accessors}(target, getters, setters)
+	return ${this.builtin("setmetatable").name}(target, {
+		__index = function(self, key)
+			local get = getters[key]
+			if get ~= nil then
+				return get(self)
+			end
+			return nil
+		end,
+		__newindex = function(self, key, value)
+			local set = setters[key]
+			if set ~= nil then
+				set(self, value)
+				return
+			end
+			if getters[key] ~= nil then
+				${this.builtin("error").name}("Cannot assign to '" .. ${this.builtin("tostring").name}(key) .. "': it has a getter and no setter", 2)
+			end
+			${this.builtin("rawset").name}(self, key, value)
+		end,
+	})
+end`).body.statements)
+        }
         const assign = this.helpers.get("assign")
         if (assign) {
             // assign(target, ...sources): copy each source's keys into target, in order.
@@ -565,7 +673,7 @@ end`).body.statements)
                 luau.local(["result"], [this.array(luau.table([]))]),
                 luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
                     luau.local(["part"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
-                    luau.callStatement(luau.call(luau.member(this.builtin("table"), "move"), [
+                    luau.callStatement(luau.call(this.move(), [
                         luau.identifier("part"), luau.number(1), luau.unary("#", luau.identifier("part")),
                         luau.binary("+", luau.unary("#", luau.identifier("result")), luau.number(1)),
                         luau.identifier("result"),
@@ -702,6 +810,8 @@ end`).body.statements)
                     names.push("default")
                     break
                 case "ExportNamedStatement": {
+                    // `export type { A }` names types: nothing exists at runtime.
+                    if (statement.typeOnly) break
                     if (statement.source) {
                         const key = resolve(statement.source)
                         if (key === undefined) break
@@ -795,6 +905,27 @@ end`).body.statements)
         const declarations: L.Statement[] = []
         for (let i = 0; i < locals.length; i += 100) declarations.push(luau.local(locals.slice(i, i + 100), []))
         return [...declarations, ...hoisted, ...requires, ...body]
+    }
+
+    /** `import("./x")`: the bundle's `import`, called with the module's name.
+     *  It answers the module's exports table — what `import * as` names. */
+    private importExpression(node: T.ImportExpression): L.Expression {
+        const context = this.options.module
+        if (!context) {
+            this.report(node, "import() needs a bundle: build the project with @tilua/compiler")
+            return luau.nil()
+        }
+        const source = node.source
+        if (source.type !== "StringLiteral") {
+            this.report(source, "import() takes a string literal: which module it loads is decided when the project is built")
+            return luau.nil()
+        }
+        const key = context.resolve(source.value, true)
+        if (key === undefined) {
+            this.report(source, `Cannot find module '${source.value}'`)
+            return luau.nil()
+        }
+        return luau.call(context.import ?? context.require, [luau.string(key)])
     }
 
     private isRewritten(node: object): boolean {
@@ -960,7 +1091,7 @@ end`).body.statements)
                 return this.variableDeclaration(node, "declare")
 
             case "FunctionDeclaration":
-                return [{ ...luau.localFunction(this.name(node.name.name), this.functionBody(node.func)), attributes: node.attributes }]
+                return [{ ...luau.localFunction(this.name(node.name.name), this.functionBody(node.func)), attributes: this.lua51 ? undefined : node.attributes }]
 
             case "FunctionDeclarationStatement":
                 return [this.functionDeclarationStatement(node)]
@@ -997,8 +1128,15 @@ end`).body.statements)
             // kept — Lua has no expression statement — and it cannot run
             // anything, since a call is a `CallStatement` instead, so dropping
             // it changes nothing but the noise.
-            case "ExpressionStatement":
-                return []
+            case "ExpressionStatement": {
+                // `import("./setup")` on a line of its own does run something:
+                // the module, the first time anything asks for it.
+                let expression = node.expression
+                while (expression.type === "ParenthesizedExpression") expression = expression.expression
+                if (expression.type !== "ImportExpression") return []
+                const call = this.importExpression(expression)
+                return call.type === "CallExpression" ? [this.from(luau.callStatement(call), node)] : []
+            }
 
             case "DoStatement":
                 return [{ type: "DoStatement", body: this.block(node.body), ...spanOf(node) }]
@@ -1070,9 +1208,16 @@ end`).body.statements)
                 const variables = form.walks === "values" ? [this.names.fresh("_"), item] : [item]
                 // An iteration is `[step, state, first]`: the three Luau loops
                 // with, taken out of the array they are.
-                const iterators = form.walks === "iteration"
+                let iterators = form.walks === "iteration"
                     ? [luau.call(this.builtin("unpack"), [source, luau.number(1), luau.number(3)])]
                     : [source]
+                // Luau walks a table handed to `for` itself. Lua 5.1 calls
+                // what it is handed: an array goes through `ipairs`, and
+                // anything else through a function that does what Luau does.
+                if (this.lua51 && form.walks === "values") {
+                    const kind = form.viaIter ? undefined : this.options.types?.typeOf.get(node.iterator)?.kind
+                    iterators = [luau.call(kind === "array" || kind === "tuple" ? this.builtin("ipairs") : this.helper("each"), [source])]
+                }
                 return [luau.genericFor(variables, iterators,
                     this.loopBody51(this.block(node.body, prelude)).statements)]
             }
@@ -1366,7 +1511,8 @@ end
             },
             isMethod,
             func,
-            attributes: node.attributes,
+            // `@native` and the like are Luau's.
+            attributes: this.lua51 ? undefined : node.attributes,
             ...spanOf(node),
         }
     }
@@ -1485,7 +1631,7 @@ end
             })
             if (pattern.rest) {
                 // `...rest`: a new array of the elements after the named ones.
-                const elements = luau.call(luau.member(this.builtin("table"), "move"), [
+                const elements = luau.call(this.move(), [
                     source, luau.number(pattern.elements.length + 1), luau.unary("#", source), luau.number(1), this.array(luau.table([])),
                 ])
                 const rest = this.restTarget(pattern.rest, elements, mode, after)
@@ -1610,8 +1756,17 @@ end
             case "ArrayExpression": return this.arrayExpression(node)
 
             case "BinaryExpression": {
+                if (node.operator === "??") return this.nullish(node)
                 const left = this.expression(node.left)
                 const right = this.expression(node.right)
+                // `"key" in t` asks whether `t` holds something there: in
+                // Lua a key whose value is nil is a key that is not there.
+                if (node.operator === "in") {
+                    return luau.parenthesized(luau.binary("~=", luau.index(this.keptToOne(right), this.keptToOne(left)), luau.nil()))
+                }
+                if (node.operator === "instanceof") {
+                    return luau.call(this.helper("instanceof"), [this.keptToOne(left), this.keptToOne(right)])
+                }
                 // Lua 5.1 has no `//`.
                 if (this.lua51 && node.operator === "//") return this.floorDivide(left, right)
                 return luau.binary(node.operator, left, right)
@@ -1650,6 +1805,9 @@ end
 
             case "ParenthesizedExpression":
                 return luau.parenthesized(this.expression(node.expression))
+
+            case "ImportExpression":
+                return this.importExpression(node)
 
             // Types only: the value is the expression itself.
             case "TypeAssertionExpression":
@@ -1719,7 +1877,7 @@ end
                 : lowered
         }
         const unpack = (value: L.Expression): L.Expression =>
-            luau.call(luau.member(this.builtin("table"), "unpack"), [value])
+            luau.call(this.lua51 ? this.builtin("unpack") : luau.member(this.builtin("table"), "unpack"), [value])
         const last = list[list.length - 1]
         if (spreads.length === 1 && last.type === "SpreadElement") {
             return [...list.slice(0, -1).map(a => this.expression(a)), unpack(this.expression(last.argument))]
@@ -1732,11 +1890,25 @@ end
     /** One link of an access chain, read from `object`. */
     private link(node: Link, object: L.Expression): L.Expression {
         switch (node.type) {
-            case "MemberExpression":
+            case "MemberExpression": {
+                // `xs.length`, `text.length`: Luau counts with `#`.
+                if (this.options.types?.lengths.has(node)) return luau.unary("#", object)
+                // `names.filter` read as a value: no Lua array has one, so it
+                // is the function the method really is, taking its `self`
+                // first as it always does.
+                const source = this.options.types?.methodReads.get(node)
+                const lowered = source && this.loweredMethod(node.property.name, source, node.object, [], node.property, node)
+                if (lowered) {
+                    const forwarded = luau.call(calleePath(lowered.callee), [...lowered.prepend, vararg()])
+                    return luau.functionExpression(luau.functionBody(lowered.passReceiver ? [] : ["_"], [luau.returns([forwarded])], true))
+                }
                 return luau.member(object, node.property.name)
+            }
             case "IndexExpression":
                 return luau.index(object, this.expression(node.index))
             case "CallExpression": {
+                const method = this.methodCalled(node)
+                if (method) return method
                 const lowered = this.loweredGlobalCall(node)
                 const args = this.arguments(node.arguments)
                 if (!lowered) return luau.call(object, args)
@@ -1758,6 +1930,28 @@ end
                 return luau.methodCall(object, node.method.name, args)
             }
         }
+    }
+
+    /** `names.filter(names, f)`: a method of the value's metatable, read with
+     *  `.` and handed its `self` as the first argument. Written as a call of
+     *  the function the method really is — `array.filter(names, f)` — where
+     *  whoever declared the metatable says so; `undefined` leaves an ordinary
+     *  call, which is right for a string's Lua methods (`text.upper(text)`
+     *  reaches Lua's own `string.upper`). */
+    private methodCalled(node: T.CallExpression): L.Expression | undefined {
+        const callee = node.callee
+        if (callee.type !== "MemberExpression") return undefined
+        const source = this.options.types?.methodReads.get(callee)
+        if (!source) return undefined
+        // The receiver has to be written out first, as itself: a spread
+        // there, or one in the middle that packs the list, is called as it is.
+        const spreads = node.arguments.map((a, i) => (a.type === "SpreadElement" ? i : -1)).filter(i => i >= 0)
+        if (!node.arguments.length || spreads.includes(0) ||
+            spreads.some(i => i !== node.arguments.length - 1)) return undefined
+        const lowered = this.loweredMethod(callee.property.name, source, callee.object, node.arguments.slice(1), callee.property, node)
+        if (!lowered) return undefined
+        const [self, ...rest] = this.arguments(node.arguments)
+        return luau.call(calleePath(lowered.callee), [...lowered.prepend, ...(lowered.passReceiver ? [self] : []), ...rest])
     }
 
     // --------------------------------------------------------
@@ -1813,7 +2007,9 @@ end
         const last = chain.links[chain.links.length - 1]
         // An `if` expression gives one value; a call may give more, as it
         // would without the `?`.
-        if (base.type === "Identifier" && segments.length === 1 && last.type !== "CallExpression" && last.type !== "MethodCallExpression") {
+        // Lua 5.1 has no `if` expression, and `a and b or nil` would lose a
+        // `false`: there the function below is the only form.
+        if (!this.lua51 && base.type === "Identifier" && segments.length === 1 && last.type !== "CallExpression" && last.type !== "MethodCallExpression") {
             return {
                 type: "IfElseExpression",
                 clauses: [{ condition: luau.binary("==", base, luau.nil()), body: luau.nil() }],
@@ -1831,6 +2027,33 @@ end
             const value = this.applySegment(segment, at)
             statements.push(i === segments.length - 1 ? luau.returns([value]) : luau.assign([at], [value]))
         })
+        const passesVarargs = statements.some(usesVararg)
+        const func = luau.functionExpression(luau.functionBody([], statements, passesVarargs))
+        return luau.call(luau.parenthesized(func), passesVarargs ? [vararg()] : [])
+    }
+
+    /** `a ?? b`: `a`, or `b` where `a` is nil — read only then. A `false`
+     *  stays, which is what sets it apart from `a or b`. A name is tested
+     *  in place; anything else is read once, into a local. */
+    private nullish(node: T.BinaryExpression): L.Expression {
+        const left = this.keptToOne(this.expression(node.left))
+        const right = this.keptToOne(this.expression(node.right))
+        if (!this.lua51 && left.type === "Identifier") {
+            return {
+                type: "IfElseExpression",
+                clauses: [{ condition: luau.binary("~=", left, luau.nil()), body: left }],
+                alternate: right,
+                line: left.line,
+                column: left.column,
+            }
+        }
+        const ref = this.names.fresh("value")
+        const at = luau.identifier(ref)
+        const statements: L.Statement[] = [
+            luau.local([ref], [left]),
+            luau.ifThen(luau.binary("~=", at, luau.nil()), [luau.returns([at])]),
+            luau.returns([right]),
+        ]
         const passesVarargs = statements.some(usesVararg)
         const func = luau.functionExpression(luau.functionBody([], statements, passesVarargs))
         return luau.call(luau.parenthesized(func), passesVarargs ? [vararg()] : [])
@@ -1994,11 +2217,24 @@ end
                     current = []
                     parts.push(this.expression(f.argument))
                     break
+                case "TableFieldAccessor":
+                    // Kept apart: the object's metatable runs them.
+                    break
             }
         }
-        if (parts.length === 0) return luau.table(current)
-        if (current.length) parts.push(luau.table(current))
-        return luau.call(this.helper("assign"), [luau.table([]), ...parts])
+        let made: L.Expression
+        if (parts.length === 0) made = luau.table(current)
+        else {
+            if (current.length) parts.push(luau.table(current))
+            made = luau.call(this.helper("assign"), [luau.table([]), ...parts])
+        }
+        // `{ get name() { ... }, set name(v) { ... } }`: Lua has no
+        // accessors, so the object's metatable reads and writes through them.
+        const accessors = node.fields.filter((f): f is Extract<T.TableField, { type: "TableFieldAccessor" }> => f.type === "TableFieldAccessor")
+        if (!accessors.length) return made
+        const table = (kind: "get" | "set"): L.Expression => luau.table(accessors.filter(f => f.kind === kind).map(f =>
+            luau.field(f.key.type === "Identifier" ? f.key.name : f.key.value, luau.functionExpression(this.classFunctionBody(f.func)))))
+        return luau.call(this.helper("accessors"), [made, table("get"), table("set")])
     }
 
     /** `[1, ...xs, 2]`. Without a spread it is a Luau sequence; with one, the

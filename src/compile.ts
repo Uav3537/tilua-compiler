@@ -41,13 +41,14 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
         throw error
     }
 
+    const { config: resolved, problems } = resolveConfig(config, resolve("main.tilua"))
+    const noLib = resolved?.noLib ?? false
     // Reassigning a `const` is an error in tilua; Luau would run it anyway.
-    const scopes = analyzeScopes(program)
+    const scopes = analyzeScopes(program, { noLib })
     const diagnostics: Diagnostic[] = scopes.diagnostics.map(d => ({
         message: d.message, line: d.node.line.start, column: d.node.column.start,
     }))
 
-    const { config: resolved, problems } = resolveConfig(config, resolve("main.tilua"))
     const libraries = resolved ? resolveTypeLibraries(resolved) : { files: [], lowerings: [], problems: [] }
     const { lowerings, problems: loweringProblems } = await loadLowerings(libraries.lowerings)
     for (const p of [...problems, ...libraries.problems]) {
@@ -57,7 +58,8 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
 
     const libs = libraries.files.map(file => parse(readFileSync(file, "utf8")))
     const lowered = lower(program, scopes, {
-        types: analyzeTypes(program, scopes, { libs, diagnostics: false }),
+        types: analyzeTypes(program, scopes, { libs, noLib, diagnostics: false }),
+        noLib,
         lowerings,
         target: resolved?.target,
         source,

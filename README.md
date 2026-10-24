@@ -11,7 +11,8 @@ npx tilua src/main.tilua --out build/main.luau
 ```
 
 ```
-tilua <entry> [--out <file>] [--config <tilua.config.json>] [--noCheck] [--target luau|lua51]
+tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>]
+              [--noCheck] [--target luau|lua51]
 ```
 
 Every module the entry imports is bundled in. Problems are reported as
@@ -24,6 +25,9 @@ Without `--out`, the entry's own path with `.luau` is written. Without
 [`@tilua/parser`](https://www.npmjs.com/package/@tilua/parser) README for what
 goes in it.
 
+`--output` (or `"output"` in the config) makes the bundle more than one file —
+see [Several files](#several-files).
+
 ## API
 
 ```ts
@@ -35,6 +39,7 @@ const result = await bundle({
     config: { types: ["roblox"], paths: { "@shared/*": ["src/shared/*"] } },
 })
 result.code          // the Luau bundle, unless a module failed
+result.files         // [{ path, code, modules }] — one, unless `output` says otherwise
 result.diagnostics   // { file, line, column, message, category: "syntax" | "module" | "type" | "config" }
 
 // One file, no imports. The config is optional here too, and brings the same
@@ -75,8 +80,31 @@ JavaScript module the build loads.
 | `scriptArgs` | the chunk's own `...`, as `local scriptArgs = { ... }` |
 | `f(a, ...xs)` | `table.unpack(xs)` in the last position |
 | `f(...xs, a)` | the list built first, then `table.unpack` of it |
-| `x as T`, `x satisfies T`, types, `declare` | removed |
+| `import("./shop")` | `G.import("src/shop")` — the bundle's `require`, wrapped |
+| `a ?? b` | `if a ~= nil then a else b` for a name; otherwise a function that reads `a` once |
+| `n++` / `n--` | `n += 1` / `n -= 1` |
+| `"key" in t` | `(t["key"] ~= nil)` |
+| `v instanceof Dog` | `tilua_instanceof(v, Dog)` — walks `v.ClassObject`, then each `.ParentClass` |
+| `{ a: 1, get b() { … }, set b(v) { … } }` | `tilua_accessors({ a = 1 }, { b = … }, { b = … })` — a metatable runs the accessors |
+| `x as T`, `x satisfies T`, types, `interface`, `export type { … }`, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
+
+## Lua 5.1
+
+`"target": "lua51"` (or `--target lua51`) writes what stock Lua 5.1 runs. On
+top of the table above:
+
+| Luau | Lua 5.1 |
+|---|---|
+| `a += b`, `a // b`, `continue`, `if c then a else b`, `1_000`, `0b101` | assignments, `math.floor`, a `break` out of a one-pass `repeat`, `and`/`or` or a call, plain numbers |
+| `for _, item in xs do` | `ipairs(xs)` where `xs` is an array by its type; otherwise `tilua_each(xs)`, which walks a table as Luau would — its `__iter` if it has one, `next` if not |
+| `if a == nil then nil else a.b` (`a?.b`) | the function form, which keeps a `false` |
+| `table.move`, `table.unpack` | `tilua_move`, `unpack` |
+| `@native` and other attributes | dropped |
+
+An object's `freeze` does nothing there and `isFrozen` answers `false`: Lua 5.1
+cannot freeze a table. `npm test` with `LUA51` naming a Lua 5.1 interpreter
+builds a program for both targets and checks they print the same.
 
 ## `typeof`, arrays and objects
 
@@ -169,10 +197,12 @@ the fast one.
 
 ## What a type library lowers
 
-The compiler lowers tilua. What a *library* gives a value, the library also
-says how to run: `names:filter(f)` is a call to a function because
-[`@tilua-types/lua`](https://www.npmjs.com/package/@tilua-types/lua) declares
-the method and ships the Luau behind it.
+The compiler lowers tilua, and Lua's standard library, which every file has:
+`pcall` answers one value, `console:log` prints where it was called, `error`
+names the project's file (runtime/console.luau, runtime/result.luau). What a
+*library* gives a value, the library also says how to run: `names:first()` is
+a call to a function because the library that declared `first` ships the Luau
+behind it.
 
 A library names a module in its package.json (`"tilua": { "lowering":
 "lowering.mjs" }`) whose default export answers for a call. The contract is
@@ -207,8 +237,8 @@ declared as). An answer can `prepend` Luau expressions ahead of the written
 arguments. `globalCall` and `globalValue` answer for a global, such as
 `print(x)` or a bare `print`. A runtime can read `__LINES__` to reach the
 bundle's line map, and wraps a new array it answers with in `__ARRAY__(...)`. See the `@tilua/parser` README for the details.
-`console:log` is not built into the compiler: `@tilua-types/lua` implements it
-with these hooks.
+The standard library's own lowering (src/standard.ts) is written with these
+hooks too; `"noLib": true` leaves it out with the library.
 
 ## Errors at runtime
 
@@ -225,8 +255,12 @@ src/util.tilua:3: attempt to index nil with 'value'
 ```
 
 A message that is not a string is raised unchanged. A position that is already
-in the project's files, such as one from `error` in `@tilua-types/lua`, is
+in the project's files, such as one from the standard library's `error`, is
 left as it is.
+
+With several files each has its own line map, and a position is read by the
+map of the file it names — matched by the end of that file's path, since the
+Lua running it may call it by a full path, a relative one, or an Instance's.
 
 ## Modules
 
@@ -281,6 +315,61 @@ Modules follow ES module rules, including when they import each other:
 - **Types only.** `import type` is erased whatever it names, and so is an
   import used only as a type. A module reached only that way is left out of
   the bundle and never runs.
+- **`import()`.** `import("./shop")` is `G.import("src/shop")`, and `G.import`
+  is a wrapper around `G.require`: it answers the module's exports table — the
+  value `import * as Shop` names — where the code runs, loading the module if
+  nothing has yet. Nothing is awaited: Lua has no promises, and a module is
+  loaded by calling it. The path is a string literal; the module it names is
+  part of the bundle like any other.
+
+## Several files
+
+`"output"` in `tilua.config.json` (or `--output`, or `bundle({ output })`)
+says how many files the project becomes:
+
+| `output` | files |
+|---|---|
+| `"single"` (default) | one, holding every module |
+| `"chunks"` | the entry's, holding what it reaches through `import` statements; one for each `import()` that leads somewhere else, holding what only it reaches; and one for what several of those share |
+| `"modules"` | one per module, in the project's own tree |
+
+```
+tilua src/main.tilua --out build/main.luau --output chunks
+# build/main.luau, build/main_src_shop.luau, ...
+
+tilua src/main.tilua --out build --output modules
+# build/src/main.luau, build/src/shop.luau, ...
+```
+
+With `"modules"`, `--out` is the folder the tree goes in — by default the
+project's, so each `.luau` lands beside its `.tilua`. From the API,
+`result.files` holds every file with the path it has to be written at, the
+entry's first; `outFile` names the entry's file, which the others are named
+after.
+
+The module table is the same one, filled by more than one file. The entry's
+file has the runtime; every other file is a function that adds its modules:
+
+```lua
+return function(G)
+    G.modules["src/shop"] = { load = function(exports) ... end }
+end
+```
+
+`G.files` says which file each of those modules is in, and `require` loads
+that file, once, the first time one of its modules is asked for — by an
+`import()`, or by an `import` statement in a module that was itself loaded
+late. So a file costs nothing until then.
+
+How a file is loaded is the one thing the two targets do not share:
+
+| `target` | loads a file with |
+|---|---|
+| `"luau"` | `require("./main_src_shop")(G)` — Luau's `require` by path, read from the entry's own file. In Roblox each file is a ModuleScript beside the entry's |
+| `"lua51"` | `loadfile(folder .. "main_src_shop.luau")()(G)`, where `folder` is the entry's own, read off `debug.getinfo` |
+
+Either way the files have to stay where they were written, relative to the
+entry's.
 
 ## Development
 

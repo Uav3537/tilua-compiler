@@ -2,7 +2,7 @@
  * Which `tilua.config.json` a build uses.
  */
 import { resolve } from "node:path"
-import { findConfig, loadConfig, nodeHost, type ConfigProblem, type TiluaConfig } from "@tilua/parser"
+import { findConfig, loadConfig, nodeHost, type ConfigProblem, type OutputMode, type TiluaConfig } from "@tilua/parser"
 import type { Target } from "./lower.js"
 
 /** What `tilua.config.json` holds. */
@@ -20,6 +20,13 @@ export interface TiluaConfigJson {
      *  `a += b`, `continue`, `if c then a else b` as an expression, `//`,
      *  digit separators and binary literals. */
     target?: Target
+    /** How many files the output is. `"single"` (the default) is one file;
+     *  `"chunks"` also writes a file for what only an `import()` reaches,
+     *  loaded when it is first asked for; `"modules"` writes one per module. */
+    output?: OutputMode
+    /** Leave out Lua's standard library — `print`, `string`, `pcall` — which
+     *  is otherwise there for every file, as JavaScript's is in TypeScript. */
+    noLib?: boolean
 }
 
 /** A config file's path, or the config itself. Relative paths — to a config

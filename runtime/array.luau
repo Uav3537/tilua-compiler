@@ -1,5 +1,13 @@
 local __NAME__ = {}
 
+-- `table.move`, which Lua 5.1 does not have.
+local __NAME___move = table.move or function(from, first, last, at, to)
+	for i = first, last do
+		to[at + i - first] = from[i]
+	end
+	return to
+end
+
 function __NAME__.find(t, test)
 	for i = 1, #t do
 		if test(t[i], i) then
@@ -96,10 +104,10 @@ end
 
 function __NAME__.concat(t, ...)
 	local out = __ARRAY__({})
-	table.move(t, 1, #t, 1, out)
+	__NAME___move(t, 1, #t, 1, out)
 	for i = 1, select("#", ...) do
 		local part = select(i, ...)
-		table.move(part, 1, #part, #out + 1, out)
+		__NAME___move(part, 1, #part, #out + 1, out)
 	end
 	return out
 end
@@ -127,7 +135,7 @@ function __NAME__.flat(t)
 	for i = 1, #t do
 		local value = t[i]
 		if type(value) == "table" then
-			table.move(value, 1, #value, #out + 1, out)
+			__NAME___move(value, 1, #value, #out + 1, out)
 		else
 			out[#out + 1] = value
 		end
@@ -137,7 +145,7 @@ end
 
 function __NAME__.reverse(t)
 	local n = #t
-	for i = 1, n // 2 do
+	for i = 1, math.floor(n / 2) do
 		t[i], t[n - i + 1] = t[n - i + 1], t[i]
 	end
 	return t
