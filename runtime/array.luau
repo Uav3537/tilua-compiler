@@ -130,6 +130,30 @@ function __NAME__.slice(t, start, stop)
 end
 
 -- One level, as JavaScript's `flat()` does by default.
+function __NAME__.keys(t)
+	local out = __ARRAY__({})
+	for i = 1, #t do
+		out[i] = i
+	end
+	return out
+end
+
+function __NAME__.values(t)
+	local out = __ARRAY__({})
+	for i = 1, #t do
+		out[i] = t[i]
+	end
+	return out
+end
+
+function __NAME__.entries(t)
+	local out = __ARRAY__({})
+	for i = 1, #t do
+		out[i] = __ARRAY__({ i, t[i] })
+	end
+	return out
+end
+
 function __NAME__.flat(t)
 	local out = __ARRAY__({})
 	for i = 1, #t do

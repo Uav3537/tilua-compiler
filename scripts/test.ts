@@ -242,7 +242,7 @@ await lowers("object literals", `const t = { a: 1, "b-c": 2, [k]: 3, d }`, `loca
 await lowers("array literals are tables", "const xs = [1, 2, 3]", "local xs = { 1, 2, 3 };")
 await lowers("object spread copies in order",
     "const t = { a: 1, ...base, b: 2 }",
-    `local function tilua_assign(target, ...) for i = 1, select("#", ...) do local source = select(i, ...); if source ~= nil then for key, value in pairs(source) do target[key] = value; end; end; end; return target; end; local t = tilua_assign({}, { a = 1 }, base, { b = 2 });`)
+    `local function tilua_assign(target, ...) for i = 1, select("#", ...) do local source = (select(i, ...)); if source ~= nil then for key, value in pairs(source) do target[key] = value; end; local meta = type(source) == "table" and getmetatable(source) or nil; local getters = type(meta) == "table" and rawget(meta, "__tiluaGetters") or nil; if getters ~= nil then for key, get in pairs(getters) do target[key] = get(source); end; end; end; end; return target; end; local t = tilua_assign({}, { a = 1 }, base, { b = 2 });`)
 await lowers("array spread joins the runs",
     "const xs = [f(), ...ys, g()]",
     `local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { g() });`)
@@ -1410,8 +1410,8 @@ await lowers("class: the simple case is the plain Lua idiom",
         "",
         "",
     ].join("\n"),
-    "local function tilua_class(base) local class = { __getters = {}, __setters = {} }; class.__index = class; "
-    + "class.ClassObject = class; class.ParentClass = base; "
+    "local function tilua_class(base, name) local class = { __getters = {}, __setters = {} }; class.__index = class; "
+    + "class.ClassObject = class; class.ParentClass = base; class.name = name; "
     + "if base ~= nil then setmetatable(class, { __index = base }); setmetatable(class.__getters, { __index = base.__getters }); "
     + "setmetatable(class.__setters, { __index = base.__setters }); for _, key in ipairs({ \"__add\", \"__sub\", \"__mul\", \"__div\", \"__idiv\", \"__mod\", \"__pow\", \"__unm\", \"__concat\", \"__len\", \"__eq\", \"__lt\", \"__le\", \"__call\", \"__tostring\", \"__iter\" }) do class[key] = base[key]; end; end; return class; end; "
     + "local function tilua_accessors(class) "
@@ -1420,7 +1420,7 @@ await lowers("class: the simple case is the plain Lua idiom",
     + "class.__index = function(this, key) local getter = class.__getters[key]; if getter ~= nil then return getter(this); end; return class[key]; end; "
     + "class.__newindex = function(this, key, value) local setter = class.__setters[key]; if setter ~= nil then setter(this, value); return; end; rawset(this, key, value); end; "
     + "end; "
-    + "local Counter = tilua_class(nil); "
+    + "local Counter = tilua_class(nil, \"Counter\"); "
     + "function Counter.bump(this) this.n += 1; return this.n; end; "
     + "function Counter.__init(this, ...) this.n = 0; end; "
     + "function Counter.new(...) local this = setmetatable({}, Counter); Counter.__init(this, ...); return this; end; "
@@ -1851,6 +1851,12 @@ lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[])
             "print(person.full, person.initial)",
             "person.full = \"Grace\"",
             "print(person.full, person.first)",
+            "const snapshot = { ...person }",
+            "print(snapshot.full, snapshot.initial)",
+            "const Anon = class { constructor() {} }",
+            "print(Dog.name, rex.ClassObject.name, rex.ClassObject.ParentClass?.name, Anon.name)",
+            "const letters = [\"x\", \"y\"]",
+            "print(letters:keys():join(\",\"), letters:values():join(\",\"), letters:entries()[2][1], letters:entries()[2][2])",
             "const written = pcall(() => { (person as any).initial = \"z\" })",
             "print(written.success, tostring(written.error))",
             "",
@@ -1866,6 +1872,9 @@ lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[])
         "I am Rex",
         "Ada Lovelace\tA",
         "Grace Lovelace\tGrace",
+        "Grace Lovelace\tG",
+        "Dog\tDog\tAnimal\tAnon",
+        "1,2\tx,y\t2\ty",
     ]
     const output = run("bundle: TypeScript's operators, interfaces and accessors", result)
     if (output) {

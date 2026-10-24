@@ -180,7 +180,9 @@ another, and one the class writes itself replaces the copy.
 Two links come with every class, and they cost an instance nothing because
 they live on the class table: `ClassObject`, which an instance reads through
 its metatable to reach its own class, and `ParentClass`, which a class reads
-to reach the one it extends.
+to reach the one it extends. The class table holds its `name` too
+(`tilua_class(base, "Dog")`), so `rex.ClassObject.name` says what built an
+instance.
 
 A class written as a value (`const Counter = class { … }`) is the same code,
 inside a function that runs where the class is written and hands the table

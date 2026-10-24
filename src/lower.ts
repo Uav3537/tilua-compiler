@@ -180,7 +180,24 @@ class Lowerer {
         for (const binding of scopes.bindings.values()) {
             if (binding.declarationNode) this.bindingByDeclaration.set(binding.declarationNode, binding)
         }
+        // `const Counter = class { ... }`: a class with no name of its own is
+        // known by what holds it, as JavaScript's `name` says.
+        const visit = (value: unknown): void => {
+            if (!value || typeof value !== "object") return
+            if (Array.isArray(value)) return void value.forEach(visit)
+            const node = value as { type?: string; name?: { type?: string; name?: string }; init?: { type?: string; expression?: unknown } }
+            if (node.type === "VariableDeclaration" && node.name?.type === "IdentifierPattern" && node.name.name) {
+                let init = node.init as { type?: string; expression?: unknown } | undefined
+                while (init?.type === "ParenthesizedExpression") init = init.expression as typeof init
+                if (init?.type === "ClassExpression") this.classExpressionNames.set(init as unknown as T.ClassExpression, node.name.name)
+            }
+            for (const [key, child] of Object.entries(value)) if (key !== "line" && key !== "column") visit(child)
+        }
+        visit(source.body)
     }
+
+    /** The name each class written as a value is known by. */
+    private readonly classExpressionNames = new WeakMap<T.ClassExpression, string>()
 
     run(): LowerResult {
         const body = this.options.module
@@ -629,6 +646,8 @@ end`).body.statements)
             out.push(...parseLuau(`
 local function ${accessors}(target, getters, setters)
 	return ${this.builtin("setmetatable").name}(target, {
+		-- Read by a spread, which copies what the getters give.
+		__tiluaGetters = getters,
 		__index = function(self, key)
 			local get = getters[key]
 			if get ~= nil then
@@ -652,18 +671,28 @@ end`).body.statements)
         }
         const assign = this.helpers.get("assign")
         if (assign) {
-            // assign(target, ...sources): copy each source's keys into target, in order.
-            out.push(luau.localFunction(assign, luau.functionBody(["target"], [
-                luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
-                    luau.local(["source"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
-                    luau.ifThen(luau.binary("~=", luau.identifier("source"), luau.nil()), [
-                        luau.genericFor(["key", "value"], [luau.call(this.builtin("pairs"), [luau.identifier("source")])], [
-                            luau.assign([luau.index(luau.identifier("target"), luau.identifier("key"))], [luau.identifier("value")]),
-                        ]),
-                    ]),
-                ]),
-                luau.returns([luau.identifier("target")]),
-            ], true)))
+            // assign(target, ...sources): copy each source's keys into target,
+            // in order. An object literal's getters live in its metatable, not
+            // among its keys: a spread reads them, as JavaScript's does.
+            out.push(...parseLuau(`
+local function ${assign}(target, ...)
+	for i = 1, ${this.builtin("select").name}("#", ...) do
+		local source = (${this.builtin("select").name}(i, ...))
+		if source ~= nil then
+			for key, value in ${this.builtin("pairs").name}(source) do
+				target[key] = value
+			end
+			local meta = ${this.builtin("type").name}(source) == "table" and ${this.builtin("getmetatable").name}(source) or nil
+			local getters = ${this.builtin("type").name}(meta) == "table" and ${this.builtin("rawget").name}(meta, "__tiluaGetters") or nil
+			if getters ~= nil then
+				for key, get in ${this.builtin("pairs").name}(getters) do
+					target[key] = get(source)
+				end
+			end
+		end
+	end
+	return target
+end`).body.statements)
         }
         out.push(...runtimes)
         const concat = this.helpers.get("concat")
@@ -1316,11 +1345,12 @@ end`).body.statements)
         // itself then replaces the copy.
         const metamethods = `{ ${CLASS_METAMETHODS.map(name => `"${name}"`).join(", ")} }`
         return parseLuau(`
-local function ${build}(base)
+local function ${build}(base, name)
     local class = { __getters = {}, __setters = {} }
     class.__index = class
     class.ClassObject = class
     class.ParentClass = base
+    class.name = name
     if base ~= nil then
         setmetatable(class, { __index = base })
         setmetatable(class.__getters, { __index = base.__getters })
@@ -1379,7 +1409,13 @@ end
      *  table is assigned to `self`, which a module has already declared. */
     private classStatements(node: T.ClassLike, self: L.Expression, declare?: string): L.Statement[] {
         const { build, accessors } = this.classRuntime()
-        const create = luau.call(luau.identifier(build), [node.superclass ? this.reference(node.superclass) : luau.nil()])
+        // What it is called: `Dog.name`. One written as a value with no name
+        // of its own takes the name of what holds it, as JavaScript's does.
+        const called = node.name?.name ?? (node.type === "ClassExpression" ? this.classExpressionNames.get(node) : undefined) ?? ""
+        const create = luau.call(luau.identifier(build), [
+            node.superclass ? this.reference(node.superclass) : luau.nil(),
+            luau.string(called),
+        ])
         const out: L.Statement[] = [declare !== undefined
             ? luau.local([declare], [create])
             : luau.assign([self], [create])]
