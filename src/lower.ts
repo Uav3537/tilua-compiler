@@ -140,13 +140,41 @@ export interface ModuleInfo {
 }
 
 export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerOptions = {}): LowerResult {
-    return new Lowerer(program, scopes, options).run()
+    const result = new Lowerer(program, scopes, options).run()
+    dropUnreachable(result.statements)
+    return result
+}
+
+/** Statements after a `return`, `break` or `continue` never run. tilua lets
+ *  them be written, as JavaScript does — an editor shows them dimmed — but
+ *  Luau allows nothing after one in its block, so they are left out. */
+function dropUnreachable(statements: L.Statement[]): void {
+    const exit = statements.findIndex(s =>
+        s.type === "ReturnStatement" || s.type === "BreakStatement" || s.type === "ContinueStatement")
+    if (exit >= 0) statements.length = exit + 1
+    for (const statement of statements) visitBlocks(statement)
+}
+
+function visitBlocks(node: unknown): void {
+    if (!node || typeof node !== "object") return
+    if (Array.isArray(node)) {
+        for (const item of node) visitBlocks(item)
+        return
+    }
+    const record = node as Record<string, unknown>
+    if (record.type === "Block" && Array.isArray(record.statements)) {
+        dropUnreachable(record.statements as L.Statement[])
+        return
+    }
+    for (const key in record) {
+        if (key !== "line" && key !== "column") visitBlocks(record[key])
+    }
 }
 
 /** A runtime helper the output needs, emitted once at the top of the file.
  *  `assign` and `concat` are the language's own (spreads); a `lowering` is a
  *  table a type library asked for, by the key it gave it. */
-type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors" | { lowering: number; runtime: string }
+type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors" | "add" | { lowering: number; runtime: string }
 
 type Mode = "declare" | "assign"
 
@@ -164,6 +192,11 @@ class Lowerer {
     private readonly exportsName: string
     /** Globals generated code calls, renamed where the source shadows them. */
     private readonly builtins = new Map<string, string>()
+    /** The `try` blocks being lowered in the current function, innermost
+     *  last; see `tryStatement`. A function written inside one starts afresh. */
+    private tryFrames: TryFrame[] = []
+    /** The loops being lowered in the current function, innermost last. */
+    private loops: LoopFrame[] = []
     /** Whether the output has to be plain Lua 5.1 rather than Luau. */
     private readonly lua51: boolean
     /** The source line each emitted statement came from. */
@@ -272,7 +305,7 @@ class Lowerer {
         return this.lua51 ? this.helper("move") : luau.member(this.builtin("table"), "move")
     }
 
-    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors"): L.Identifier {
+    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors" | "add"): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
             // `tilua_array` is the array methods' own table.
@@ -617,6 +650,19 @@ local function ${typeOf}(value, known)
 	return "object"
 end`).body.statements)
             }
+        }
+        const add = this.helpers.get("add")
+        if (add) {
+            // `a + b` where only the values can say whether it joins strings
+            // or adds numbers: as TypeScript does, a string on either side
+            // makes it a join.
+            out.push(...parseLuau(`
+local function ${add}(a, b)
+	if ${this.builtin("type").name}(a) == "string" or ${this.builtin("type").name}(b) == "string" then
+		return ${this.builtin("tostring").name}(a) .. ${this.builtin("tostring").name}(b)
+	end
+	return a + b
+end`).body.statements)
         }
         const instanceOf = this.helpers.get("instanceof")
         if (instanceOf) {
@@ -1105,7 +1151,53 @@ end`).body.statements)
         return statement
     }
 
+    /** A statement; a loop with what its labels need around it.
+     *
+     *  Luau has no labels, and no `goto` to stand in for them. `break outer`
+     *  in a loop inside `outer` sets a flag `outer` declares and breaks the
+     *  loop it is in; right after that loop, the flag is checked, and the
+     *  check breaks again — or, once it is `outer` that would be left, does
+     *  what was asked of `outer` itself. `continue outer` is the same, with
+     *  `continue` done there and the flag lowered for the next time round. */
     private statementOf(node: T.Statement): L.Statement[] {
+        if (!LOOPS.has(node.type)) return this.statementKind(node)
+        const loop: LoopFrame = {
+            label: (node as { label?: T.Identifier }).label?.name,
+            tryDepth: this.tryFrames.length,
+            leaving: new Set(),
+        }
+        this.loops.push(loop)
+        let lowered: L.Statement[]
+        try {
+            lowered = this.statementKind(node)
+        } finally {
+            this.loops.pop()
+        }
+        const flags = [loop.breakFlag, loop.continueFlag].filter((f): f is string => f !== undefined)
+        const out: L.Statement[] = [...(flags.length ? [luau.local(flags, flags.map(() => luau.boolean(false)))] : []), ...lowered]
+        const enclosing = this.loops[this.loops.length - 1]
+        for (const target of loop.leaving) {
+            if (target === enclosing) {
+                if (target.breakFlag) out.push(luau.ifThen(luau.identifier(target.breakFlag), this.jump("break", undefined)))
+                if (target.continueFlag) {
+                    out.push(luau.ifThen(luau.identifier(target.continueFlag), [
+                        luau.assign([luau.identifier(target.continueFlag)], [luau.boolean(false)]),
+                        ...this.jump("continue", undefined),
+                    ]))
+                }
+                continue
+            }
+            enclosing?.leaving.add(target)
+            const raised = [target.breakFlag, target.continueFlag]
+                .filter((f): f is string => f !== undefined)
+                .map(f => luau.identifier(f) as L.Expression)
+                .reduce((a, b) => luau.binary("or", a, b))
+            out.push(luau.ifThen(raised, this.jump("break", undefined)))
+        }
+        return out
+    }
+
+    private statementKind(node: T.Statement): L.Statement[] {
         switch (node.type) {
             // Types, and what exists only for them.
             case "TypeAliasStatement":
@@ -1131,15 +1223,21 @@ end`).body.statements)
             case "AssignmentStatement":
                 return this.assignment(node)
 
-            case "CompoundAssignmentStatement":
-                if (this.lua51) return this.compoundAssignment51(node)
+            case "CompoundAssignmentStatement": {
+                if (node.operator === "??=") return this.nullishAssignment(node)
+                // `s += "x"` joins: `s ..= "x"`.
+                const join = node.operator === "+=" ? this.options.types?.joins.get(node) : undefined
+                if (join === "dynamic") return this.dynamicAddition(node)
+                const operator = join === "concat" ? "..=" : node.operator
+                if (this.lua51) return this.compoundAssignment51(node, operator)
                 return [{
                     type: "CompoundAssignmentStatement",
-                    operator: node.operator,
+                    operator,
                     target: this.expression(node.target),
                     value: this.expression(node.value),
                     ...spanOf(node),
                 }]
+            }
 
             case "CallStatement": {
                 const chain = optionalChain(node.expression)
@@ -1253,13 +1351,22 @@ end`).body.statements)
 
             case "ReturnStatement":
                 // One value — several are an array, and that is a table.
-                return [luau.returns(node.argument ? [this.keptToOne(this.expression(node.argument))] : [])]
+                return this.jump("return", node.argument && this.keptToOne(this.expression(node.argument)), node)
 
             case "BreakStatement":
-                return [{ type: "BreakStatement", ...spanOf(node) }]
+                return this.jump("break", undefined, node, node.label?.name)
 
             case "ContinueStatement":
-                return [{ type: "ContinueStatement", ...spanOf(node) }]
+                return this.jump("continue", undefined, node, node.label?.name)
+
+            // Level 0: what is thrown is what a `catch` is handed, with no
+            // position put in front of a string.
+            case "ThrowStatement":
+                return [luau.callStatement(luau.call(this.builtin("error"),
+                    [this.keptToOne(this.expression(node.argument)), luau.number(0)]))]
+
+            case "TryStatement":
+                return this.tryStatement(node)
 
             case "ImportStatement":
                 // Types only: erased like every other type.
@@ -1277,6 +1384,112 @@ end`).body.statements)
                     : "Imports and exports need a bundle: build the project with @tilua/compiler")
                 return []
         }
+    }
+
+    /** A `return`, `break` or `continue`. Inside a `try` that it leaves, it
+     *  is the `try`'s function returning a code saying which — and the value
+     *  — for the code after the `pcall` to do it there. */
+    private jump(kind: Jump, value: L.Expression | undefined, node?: T.BaseNode, label?: string): L.Statement[] {
+        const at = node ? spanOf(node) : {}
+        const frame = this.tryFrames[this.tryFrames.length - 1]
+        const target = kind === "return" ? undefined
+            : label === undefined ? this.loops[this.loops.length - 1]
+            : this.loops.findLast(loop => loop.label === label)
+        // Out of the `try` it is in: its function returns a code for it.
+        if (frame && (kind === "return" || (target && target.tryDepth < this.tryFrames.length))) {
+            const key = `${kind}:${label ?? ""}`
+            let exit = frame.exits.get(key)
+            if (!exit) {
+                exit = { kind, label, code: kind === "return" ? 1 : frame.exits.size + 2 }
+                frame.exits.set(key, exit)
+            }
+            if (value) frame.returnsValue = true
+            return [luau.returns([luau.number(exit.code), ...(value ? [value] : [])])]
+        }
+        if (kind === "return") return [{ ...luau.returns(value ? [value] : []), ...at }]
+        const plain = (): L.Statement => kind === "break"
+            ? { ...luau.breakStatement(), ...at }
+            : { ...luau.breakStatement(), type: "ContinueStatement", ...at } as L.Statement
+        const innermost = this.loops[this.loops.length - 1]
+        if (!target || target === innermost) return [plain()]
+        // `break outer` from a loop inside it: raise its flag, and leave the
+        // loop this is in. What follows that loop takes it from there.
+        const flag = kind === "break"
+            ? target.breakFlag ??= this.names.fresh(`${target.label}Broke`)
+            : target.continueFlag ??= this.names.fresh(`${target.label}Continued`)
+        innermost.leaving.add(target)
+        return [luau.assign([luau.identifier(flag)], [luau.boolean(true)]), { ...luau.breakStatement(), ...at }]
+    }
+
+    /** `try { a } catch (e) { b } finally { c }`:
+     *
+     *      local ok, result, value = pcall(function() a end)
+     *      if not ok then
+     *          ok, result, value = pcall(function(e) b end, result)
+     *      end
+     *      do c end
+     *      if not ok then error(result, 0) end
+     *      if result == 1 then return value elseif ... end
+     *
+     *  Without a `finally`, the `catch` runs in place of the second `pcall`:
+     *  nothing has to run after it. A `return`, `break` or `continue` that
+     *  leaves the `try` cannot be written inside its function; it returns a
+     *  code instead (see `jump`), and the last `if` does what it says. */
+    private tryStatement(node: T.TryStatement): L.Statement[] {
+        const ok = this.names.fresh("ok")
+        const result = this.names.fresh("result")
+        const value = this.names.fresh("value")
+        // One for the block and the `catch`: the codes they return are read
+        // by one `if`.
+        const frame: TryFrame = { exits: new Map(), returnsValue: false }
+        const guarded = (block: T.Block, params: string[], args: L.Expression[]): L.Expression => {
+            this.tryFrames.push(frame)
+            let statements: L.Statement[]
+            try {
+                statements = this.block(block).statements
+            } finally {
+                this.tryFrames.pop()
+            }
+            const passesVarargs = statements.some(usesVararg)
+            const func = luau.functionExpression(luau.functionBody(params, statements, passesVarargs))
+            return luau.call(this.builtin("pcall"), [func, ...args, ...(passesVarargs ? [vararg()] : [])])
+        }
+        const attempt = guarded(node.block, [], [])
+        const param = node.handler?.param && this.name(node.handler.param.name)
+        // Without a `finally` the `catch` runs in place; with one, it is
+        // guarded too, so the `finally` runs however the `catch` ends.
+        const inPlace = node.handler && !node.finalizer
+            ? this.block(node.handler.body, param ? [luau.local([param], [luau.identifier(result)])] : [])
+            : undefined
+        const caught = node.handler && node.finalizer
+            ? guarded(node.handler.body, [param ?? "_"], [luau.identifier(result)])
+            : undefined
+        const finalizer = node.finalizer && this.block(node.finalizer)
+        const returnsValue = frame.returnsValue
+
+        // Only what is read is named: `value` for a `return` with one, and
+        // `result` for the error or the jump.
+        const usesResult = returnsValue || frame.exits.size > 0 || !!param || !!node.finalizer
+        const names = [ok, ...(usesResult ? [result] : []), ...(returnsValue ? [value] : [])]
+        const failed = (): L.Expression => luau.unary("not", luau.identifier(ok))
+        const out: L.Statement[] = [this.from(luau.local(names, [attempt]), node)]
+        const clauses: L.IfClause[] = []
+        if (inPlace) clauses.push({ type: "IfClause", condition: failed(), body: inPlace, ...spanOf(node.handler!) })
+        if (caught) out.push(luau.ifThen(failed(), [luau.assign(names.map(luau.identifier), [caught])]))
+        if (finalizer) {
+            out.push(luau.doBlock(finalizer.statements))
+            out.push(luau.ifThen(failed(), [luau.callStatement(luau.call(this.builtin("error"), [luau.identifier(result), luau.number(0)]))]))
+        }
+        for (const exit of [...frame.exits.values()].sort((a, b) => a.code - b.code)) {
+            clauses.push({
+                type: "IfClause",
+                condition: luau.binary("==", luau.identifier(result), luau.number(exit.code)),
+                body: luau.block(this.jump(exit.kind, exit.kind === "return" && returnsValue ? luau.identifier(value) : undefined, undefined, exit.label)),
+                ...spanOf(node),
+            })
+        }
+        if (clauses.length) out.push({ type: "IfStatement", clauses, ...spanOf(node) } as L.IfStatement)
+        return out
     }
 
     private functionDeclarationStatement(node: T.FunctionDeclarationStatement): L.FunctionDeclarationStatement {
@@ -1728,6 +1941,21 @@ end
     // --------------------------------------------------------
 
     private functionBody(func: T.FunctionBody): L.FunctionBody {
+        // A function's `return` is its own, whatever `try` it is written in,
+        // and no loop around it is one its `break` can leave.
+        const frames = this.tryFrames
+        const loops = this.loops
+        this.tryFrames = []
+        this.loops = []
+        try {
+            return this.functionBodyIn(func)
+        } finally {
+            this.tryFrames = frames
+            this.loops = loops
+        }
+    }
+
+    private functionBodyIn(func: T.FunctionBody): L.FunctionBody {
         // `function T:m()` has an injected `self`; Luau's `:` supplies it.
         const params = func.isMethod ? func.params.slice(1) : func.params
         const prelude: L.Statement[] = []
@@ -1785,8 +2013,10 @@ end
                 return luau.nil()
             case "InterpolatedStringExpression": return this.interpolatedString(node)
 
+            // An object's method, `{ m() { ... } }`, keeps its `this` as the
+            // first parameter written out: a function value has no `:`.
             case "FunctionExpression":
-                return luau.functionExpression(this.functionBody(node.func))
+                return luau.functionExpression(this.classFunctionBody(node.func))
 
             case "TableExpression": return this.tableExpression(node)
             case "ArrayExpression": return this.arrayExpression(node)
@@ -1802,6 +2032,14 @@ end
                 }
                 if (node.operator === "instanceof") {
                     return luau.call(this.helper("instanceof"), [this.keptToOne(left), this.keptToOne(right)])
+                }
+                // `+` joins strings, as in TypeScript: Luau's `..` where the
+                // types say it does, and a function that asks the values
+                // where they cannot.
+                if (node.operator === "+") {
+                    const join = this.options.types?.joins.get(node)
+                    if (join === "concat") return luau.binary("..", left, right)
+                    if (join === "dynamic") return luau.call(this.helper("add"), [this.keptToOne(left), this.keptToOne(right)])
                 }
                 // Lua 5.1 has no `//`.
                 if (this.lua51 && node.operator === "//") return this.floorDivide(left, right)
@@ -2113,15 +2351,56 @@ end
         return luau.methodCall(luau.parenthesized(luau.string(format)), "format", args)
     }
 
+    /** `t ??= v`: `if t == nil then t = v end`, which no Luau has an
+     *  operator for. `v` is read only where `t` is nil. As in `a += b` for
+     *  Lua 5.1, what addresses the target is read once: an object or key
+     *  that is not a plain name goes into a local first. */
+    private nullishAssignment(node: T.CompoundAssignmentStatement): L.Statement[] {
+        const { before, target } = this.targetOnce(node.target)
+        const statement = luau.ifThen(luau.binary("==", target, luau.nil()), [luau.assign([target], [this.expression(node.value)])])
+        return before.length ? [luau.doBlock([...before, statement])] : [statement]
+    }
+
+    /** `t += v` where only the values can say whether it joins or adds:
+     *  `t = tilua_add(t, v)`, with what addresses `t` read once. */
+    private dynamicAddition(node: T.CompoundAssignmentStatement): L.Statement[] {
+        const { before, target } = this.targetOnce(node.target)
+        const statement = luau.assign([target], [luau.call(this.helper("add"), [target, this.keptToOne(this.expression(node.value))])])
+        return before.length ? [luau.doBlock([...before, statement])] : [statement]
+    }
+
+    /** An assignment's target, as an expression that may be read and written
+     *  freely: an object or key that is not a plain name goes into a local
+     *  first, so that `t[next()]` advances once. */
+    private targetOnce(node: T.Expression): { before: L.Statement[]; target: L.Expression } {
+        const before: L.Statement[] = []
+        const once = (expression: L.Expression, name: string): L.Expression => {
+            if (expression.type === "Identifier" || expression.type === "StringLiteral" || expression.type === "NumberLiteral") return expression
+            const local = this.names.fresh(name)
+            before.push(luau.local([local], [expression]))
+            return luau.identifier(local)
+        }
+        let target: L.Expression
+        if (node.type === "MemberExpression") {
+            target = luau.member(once(this.expression(node.object), "target"), node.property.name)
+        } else if (node.type === "IndexExpression") {
+            const object = once(this.expression(node.object), "target")
+            target = luau.index(object, once(this.expression(node.index), "key"))
+        } else {
+            target = this.expression(node)
+        }
+        return { before, target }
+    }
+
     /** `a += b` for Lua 5.1, which has no compound assignment: `a = a + b`.
      *
      *  The target has to be read and written, and writing it out twice would
      *  evaluate whatever addresses it twice — `t[next()] += 1` would advance
      *  twice and add to the wrong slot. So anything but a plain name has its
      *  object and key taken into locals first, and both halves use those. */
-    private compoundAssignment51(node: T.CompoundAssignmentStatement): L.Statement[] {
+    private compoundAssignment51(node: T.CompoundAssignmentStatement, written: string = node.operator): L.Statement[] {
         // `..=` is `..`, `+=` is `+`: the operator without its `=`.
-        const operator = node.operator.slice(0, -1)
+        const operator = written.slice(0, -1)
         const before: L.Statement[] = []
 
         // The target, as an expression that may be read and written freely.
@@ -2370,6 +2649,29 @@ function optionalChain(node: T.Expression): Chain | undefined {
 }
 
 /** Does `node` read `...` outside any function of its own? */
+type Jump = "return" | "break" | "continue"
+
+/** A `try` being lowered: each way out of it, by kind and label, with the
+ *  code its function returns for it — `1` for a `return`, the rest in the
+ *  order they are met. */
+interface TryFrame {
+    exits: Map<string, { kind: Jump; label?: string; code: number }>
+    returnsValue: boolean
+}
+
+/** A loop being lowered: its label, how many `try`s it is inside, the flags
+ *  a `break` or `continue` of it from a loop inside it raises, and the loops
+ *  around it a jump from inside it leaves. */
+interface LoopFrame {
+    label?: string
+    tryDepth: number
+    breakFlag?: string
+    continueFlag?: string
+    leaving: Set<LoopFrame>
+}
+
+const LOOPS: ReadonlySet<string> = new Set(["WhileStatement", "RepeatStatement", "NumericForStatement", "GenericForStatement"])
+
 function usesVararg(node: unknown): boolean {
     if (Array.isArray(node)) return node.some(usesVararg)
     if (!node || typeof node !== "object") return false

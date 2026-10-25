@@ -117,6 +117,9 @@ export interface BundleDiagnostic {
      *  `syntax`, `scope` (such as assigning to an import) and `module`
      *  problems leave no bundle. */
     readonly category: "syntax" | "scope" | "module" | "type" | "config"
+    /** A test that always comes out the same, and the like: said, and no
+     *  reason for the build to fail. */
+    readonly severity?: "warning"
 }
 
 export interface BundleResult {
@@ -924,7 +927,7 @@ function analyzeModules(
         })
         for (const d of types.diagnostics) {
             const at = d.node as { line: { start: number }; column: { start: number } }
-            said.push({ file, message: d.message, line: at.line.start, column: at.column.start, category: "type" })
+            said.push({ file, message: d.message, line: at.line.start, column: at.column.start, category: "type", severity: d.severity })
         }
         const result = { types, diagnostics: said }
         if (partials === before) {

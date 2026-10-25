@@ -73,7 +73,7 @@ async function main(from: string): Promise<never> {
         outFile: entryFile !== undefined ? basename(entryFile) : undefined,
     })
     for (const d of result.diagnostics) {
-        console.error(`${relative(process.cwd(), d.file)}:${d.line}:${d.column} ${d.message}`)
+        console.error(`${relative(process.cwd(), d.file)}:${d.line}:${d.column} ${d.severity === "warning" ? "warning: " : ""}${d.message}`)
     }
     if (result.code === undefined) {
         console.error("no bundle written")
@@ -85,7 +85,7 @@ async function main(from: string): Promise<never> {
         writeFileSync(target, file.code)
         console.log(`${target}: ${file.modules.length} module${file.modules.length === 1 ? "" : "s"}`)
     }
-    process.exit(result.diagnostics.length ? 1 : 0)
+    process.exit(result.diagnostics.some(d => d.severity !== "warning") ? 1 : 0)
 }
 
 main(entry).catch(error => {

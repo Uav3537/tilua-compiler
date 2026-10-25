@@ -128,7 +128,8 @@ async function lowersMarked(name: string, source: string, expected: string): Pro
 /** Lower `source` for stock Lua 5.1 and check its output, on one line. */
 function lowers51(name: string, source: string, expected: string): void {
     const program = parseTilua(source)
-    const result = lower(program, analyzeScopesTilua(program), { target: "lua51" })
+    const scopes = analyzeScopesTilua(program)
+    const result = lower(program, scopes, { target: "lua51", types: analyzeTypesTilua(program, scopes, { diagnostics: false }) })
     if (result.diagnostics.length) {
         failures.push(`${name}\n    did not lower: ${result.diagnostics.map(d => d.message).join("; ")}`)
         return
@@ -155,7 +156,7 @@ await lowers("satisfies and as const are dropped", "const t = { a: 1 } satisfies
 // Stock 5.1 has none of Luau's additions, and no `goto` to lower `continue` to.
 {
     lowers51("lua51: compound assignment expands", "let a = 1\na += 2", "local a = 1; a = a + (2);")
-    lowers51("lua51: concat assignment expands", "let s = \"a\"\ns ..= \"b\"", "local s = \"a\"; s = s .. (\"b\");")
+    lowers51("lua51: concat assignment expands", "let s = \"a\"\ns += \"b\"", "local s = \"a\"; s = s .. (\"b\");")
     // `t[next()] += 1` must not advance twice: object and key are read once.
     lowers51("lua51: a compound assignment reads its target once",
         "const t = [1]\nlet i = 1\nt[i] += 2",
@@ -284,7 +285,11 @@ await lowers("an iterator function is the loop's own",
 await lowers("an iteration is the three Luau loops with, taken out of the array it is",
     "declare walk: [(s: nil, previous: number | nil) => number | nil, nil, nil]\nfor (const n in walk) { print(n) }",
     "for n in unpack(walk, 1, 3) do print(n); end;")
-await lowers("attributes are kept", "@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
+await lowers("what follows a return, break or continue is left out",
+    "function f(x: number): number {\n    if (x > 1) {\n        return 1\n        print(\"dead\")\n    }\n    return x\n    print(x)\n}\nfor (i = 1, 3) {\n    if (i == 2) {\n        continue\n        print(i)\n    }\n    break\n    print(i)\n}",
+    "local function f(x) if x > 1 then return 1; end; return x; end; for i = 1, 3 do if i == 2 then continue; end; break; end;")
+await lowers("a module's code after its return is left out", "print(1)\nreturn\nconst y = 2\nprint(y)", "print(1); return;")
+await lowers("attributes are kept","@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
 await lowers("a shadowed global the output needs is captured first",
     "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
     `local tilua_table = table; local table = {}; local a = list[1]; local rest = tilua_table.move(list, 2, #list, 1, {}); print((("%s"):format(tostring(a))));`)
@@ -335,6 +340,145 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
     const output = run(name, result)
     if (output) check(name, output, expected)
 }
+
+// `+` joins strings, as in TypeScript: `..` where the types say so, a
+// function asking the values where they cannot, and `+` for numbers.
+await lowers("+ joins strings and adds numbers",
+    "const s = \"a\"\nconst n = 1\nconst j = s + n + \"!\"\nconst k = n + n\nlet t = \"\"\nt += s",
+    "local s = \"a\"; local n = 1; local j = (s .. n) .. \"!\"; local k = n + n; local t = \"\"; t ..= s;")
+await lowers("+ with a side only the values can tell asks them",
+    "function f(v: string | number) { return v + 1 }",
+    "local function tilua_add(a, b) if type(a) == \"string\" or type(b) == \"string\" then return tostring(a) .. tostring(b); end; return a + b; end; local function f(v) return (tilua_add(v, 1)); end;")
+runs("+: joins and additions run as in JavaScript", await compile([
+    "const n = 3",
+    "print(\"a\" + \"b\" == \"ab\", n + \"x\", \"x\" + n, n + n)",
+    "print(1 + 2 + \"a\", \"a\" + 1 + 2, \"a\" + (1 + 2))",
+    "function either(v: string | number): string | number { return v + 1 }",
+    "print(either(1), either(\"1\"))",
+    "let acc = \"\"",
+    "for (i = 1, 3) { acc += i }",
+    "print(acc)",
+].join("\n")) as BundleResult, ["true\t3x\tx3\t6", "3a\ta12\ta3", "2\t11", "123"])
+
+// `??=`, an object's methods, and labelled loops.
+await lowers("??= assigns where the target is nil, reading what addresses it once",
+    "let n: number | nil = nil\nn ??= 1\nconst t: { [string]: number } = {}\nt[tostring(n)] ??= 2",
+    "local n = nil; if n == nil then n = 1; end; local t = {}; do local key = tostring(n); if t[key] == nil then t[key] = 2; end; end;")
+await lowers("an object's method takes the object as its first parameter",
+    "const o = {\n    n: 1,\n    get(): number { return this.n },\n}\nprint(o:get())",
+    "local o = { n = 1, get = function(this) return this.n; end }; print((o:get()));")
+await lowers("break outer raises a flag, and the loop it leaves breaks again",
+    "outer: for (i = 1, 2) {\n    for (j = 1, 2) {\n        if (j == i) break outer\n    }\n}",
+    "local outerBroke = false; for i = 1, 2 do for j = 1, 2 do if j == i then outerBroke = true; break; end; end; if outerBroke then break; end; end;")
+runs("sugar: ??=, methods and labels run as in JavaScript", await compile([
+    "let calls = 0",
+    "function key(): string { calls += 1; return \"k\" }",
+    "const t: { [string]: string } = {}",
+    "t[key()] ??= \"first\"",
+    "t[key()] ??= \"second\"",
+    "print(t[\"k\"], calls)",
+    "const Counter = {",
+    "    count: 0,",
+    "    increment(by: number): number {",
+    "        this.count += by",
+    "        return this:current()",
+    "    },",
+    "    current(): number { return this.count },",
+    "}",
+    "print(Counter:increment(2), Counter:increment(3))",
+    "const visited: string[] = []",
+    "rows: for (i = 1, 3) {",
+    "    for (j = 1, 3) {",
+    "        if (j == 2) continue rows",
+    "        visited:push(`${i}${j}`)",
+    "    }",
+    "    visited:push(\"never\")",
+    "}",
+    "print(table.concat(visited, \",\"))",
+    "let deep = 0",
+    "a: while (true) {",
+    "    while (true) {",
+    "        while (true) {",
+    "            deep += 1",
+    "            break a",
+    "        }",
+    "    }",
+    "}",
+    "print(\"deep\", deep)",
+    "const mixed: string[] = []",
+    "o: for (i = 1, 3) {",
+    "    try {",
+    "        for (j = 1, 3) {",
+    "            if (j == 2 and i == 2) continue o",
+    "            if (i == 3) break o",
+    "            mixed:push(`${i}${j}`)",
+    "        }",
+    "    } catch (e) { }",
+    "}",
+    "print(table.concat(mixed, \",\"))",
+].join("\n")) as BundleResult, ["first\t2", "2\t5", "11,21,31", "deep\t1", "11,12,13,21"])
+
+// `throw` and `try`: `error(value, 0)` and `pcall`, with a jump out of a
+// `try` handed back as a code — and they run as JavaScript's do.
+await lowers("throw is error at level 0", "throw \"NotFound\"", "error(\"NotFound\", 0);")
+await lowers("try and catch is a pcall, and the catch runs in place",
+    "try {\n    print(1)\n} catch (e) {\n    print(e)\n}",
+    "local ok, result = pcall(function() print(1); end); if not ok then local e = result; print(e); end;")
+await lowers("a promise's catch and finally are still methods",
+    "const p = { catch: (s: unknown, f: unknown) => 1 }\np:catch(print)",
+    "local p = { catch = function(s, f) return 1; end }; p:catch(print);")
+runs("try: catch, finally, jumps out of it and nesting run as in JavaScript", await compile([
+    "function parse(s: string): number {",
+    "    const n = tonumber(s)",
+    "    if (n == nil) { throw \"NotANumber\" }",
+    "    return n",
+    "}",
+    "function safe(s: string): number {",
+    "    try {",
+    "        return parse(s)",
+    "    } catch (e) {",
+    "        print(\"caught\", e, e == \"NotANumber\")",
+    "        return -1",
+    "    } finally {",
+    "        print(\"finally\", s)",
+    "    }",
+    "}",
+    "print(safe(\"12\"), safe(\"x\"))",
+    "let total = 0",
+    "for (i = 1, 5) {",
+    "    try {",
+    "        if (i == 2) { continue }",
+    "        if (i == 4) { break }",
+    "        if (i == 3) { throw { code: i } }",
+    "        total += i",
+    "    } catch (e) {",
+    "        print(\"table\", (e as { code: number }).code)",
+    "    }",
+    "}",
+    "print(\"total\", total)",
+    "function nested(): string {",
+    "    try {",
+    "        try { throw \"inner\" } finally { print(\"inner finally\") }",
+    "    } catch (e) {",
+    "        return `outer got ${e}`",
+    "    }",
+    "    return \"no\"",
+    "}",
+    "print(nested())",
+    "function overrides(): number {",
+    "    try { return 1 } finally { return 2 }",
+    "}",
+    "print(overrides())",
+    "try {",
+    "    try { throw \"escapes\" } finally { print(\"before it goes on\") }",
+    "} catch (e) { print(\"then\", e) }",
+].join("\n")) as BundleResult, [
+    "finally\t12", "caught\tNotANumber\ttrue", "finally\tx", "12\t-1",
+    "table\t3", "total\t1",
+    "inner finally", "outer got inner",
+    "2",
+    "before it goes on", "then\tescapes",
+])
 
 // A library can do more than rename a call: `globalCall` and `globalValue`
 // reach `print(x)` and a bare `print`, and every hook is told where the call
@@ -782,7 +926,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         "    return \"!\"",
         "}",
         "function make(name: string, child: Node | nil): Node {",
-        "    return { name, child, greet: function(self: Node, suffix: string): string { return self.name .. suffix }, pair: function(): [number, number] { return [1, 2] } }",
+        "    return { name, child, greet: function(self: Node, suffix: string): string { return self.name + suffix }, pair: function(): [number, number] { return [1, 2] } }",
         "}",
         "const leaf = make(\"leaf\", nil)",
         "const root = make(\"root\", leaf)",
@@ -912,7 +1056,7 @@ function fails(name: string, result: BundleResult, message: string): void {
         "    argued += 1",
         "    return \"!\"",
         "}",
-        "const call: ((s: string) => string) | nil = function(s: string): string { return \"got\" .. s }",
+        "const call: ((s: string) => string) | nil = function(s: string): string { return \"got\" + s }",
         "const none: ((s: string) => string) | nil = nil",
         "print(call?.(arg()), none?.(arg()), argued)",
         "none?.(arg())",
@@ -999,7 +1143,7 @@ function fails(name: string, result: BundleResult, message: string): void {
             "export function Tags(a: number, b: number): boolean",
             "export function Tags(a?: number, b?: number): string",
             "export function Tags(a: number = 1, b?: number): string {",
-            "    return tostring(a) .. tostring(b)",
+            "    return tostring(a) + tostring(b)",
             "}",
             "",
             "",
@@ -1244,10 +1388,10 @@ await lowers("a rest parameter is the varargs, named",
             "        return 0",
             "    }",
             "    function describe(): string {",
-            "        return this.name .. \" has area \" .. tostring(this:area())",
+            "        return this.name + \" has area \" + tostring(this:area())",
             "    }",
             "    get label(): string {",
-            "        return \"<\" .. this.name .. \">\"",
+            "        return \"<\" + this.name + \">\"",
             "    }",
             "    set label(value: string) {",
             "        this.name = value",
@@ -1274,7 +1418,7 @@ await lowers("a rest parameter is the varargs, named",
             "        return this.side * this.side",
             "    }",
             "    function describe(): string {",
-            "        return super.describe() .. \" (square)\"",
+            "        return super.describe() + \" (square)\"",
             "    }",
             "}",
             "",
@@ -1354,7 +1498,7 @@ await lowers("a rest parameter is the varargs, named",
             "",
             "const numbers = Box.new(41)",
             "print(numbers:get() + 1)",
-            "print(numbers:map(function(n) { return tostring(n) .. \"!\" }):get())",
+            "print(numbers:map(function(n) { return tostring(n) + \"!\" }):get())",
             "",
             "class Ints extends Box<number> {",
             "    constructor(n: number) {",
@@ -1857,6 +2001,9 @@ lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[])
             "print(Dog.name, rex.ClassObject.name, rex.ClassObject.ParentClass?.name, Anon.name)",
             "const letters = [\"x\", \"y\"]",
             "print(letters:keys():join(\",\"), letters:values():join(\",\"), letters:entries()[2][1], letters:entries()[2][2])",
+            "const stats = { hp: 10, mp: 5 }",
+            "const doubled = stats:entries():map(([k, v]) => [k, v * 2]):fromEntries()",
+            "print(doubled.hp, doubled.mp)",
             "const written = pcall(() => { (person as any).initial = \"z\" })",
             "print(written.success, tostring(written.error))",
             "",
@@ -1875,6 +2022,7 @@ lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[])
         "Grace Lovelace\tG",
         "Dog\tDog\tAnimal\tAnon",
         "1,2\tx,y\t2\ty",
+        "20\t10",
     ]
     const output = run("bundle: TypeScript's operators, interfaces and accessors", result)
     if (output) {

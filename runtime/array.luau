@@ -154,6 +154,17 @@ function __NAME__.entries(t)
 	return out
 end
 
+-- `Object.fromEntries`: each `[key, value]` pair a member of a new table,
+-- a later pair over an earlier one of the same key.
+function __NAME__.fromEntries(t)
+	local out = {}
+	for i = 1, #t do
+		local entry = t[i]
+		out[entry[1]] = entry[2]
+	end
+	return out
+end
+
 function __NAME__.flat(t)
 	local out = __ARRAY__({})
 	for i = 1, #t do

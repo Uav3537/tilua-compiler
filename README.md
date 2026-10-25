@@ -75,6 +75,14 @@ JavaScript module the build loads.
 | `for (const item in xs)` | `for _, item in xs do … end` — an array or a table walked for its values |
 | `for (const item in step)` | `for item in step do … end` — an iterator function |
 | `for (const [k, v] in pairs(t))` | `for item in unpack(pairs(t), 1, 3) do local k, v = item[1], item[2] … end` — an iteration is `[step, state, first]` |
+| `t ??= v` | `if t == nil then t = v end` — what addresses `t` read once, into locals |
+| `{ m() { … } }` | `{ m = function(this) … end }` — called with `:` |
+| `break outer` from a loop inside `outer` | a flag `outer` declares, raised, and a `break`; after each loop on the way out, a check that breaks again — or, at `outer`, does the `break` or `continue` |
+| `throw value` | `error(value, 0)` — level 0, so a `catch` is handed exactly what was thrown |
+| `try { a } catch (e) { b }` | `local ok, result = pcall(function() a end) if not ok then local e = result b end` |
+| `try { a } catch (e) { b } finally { c }` | `a` and then `b` each in a `pcall`, `c` after them, and what neither caught thrown again |
+| a `return`, `break` or `continue` that leaves a `try` | its function returns a code — and the value — and an `if` after the `pcall` does the jump there |
+| code after a `return`, `break` or `continue` | left out: Luau allows nothing after one in its block |
 | `pcall(f)`, and other globals Luau answers several values from | the type library's own function, answering one — see below |
 | `function f(a, ...rest)` | `function f(a, ...) local rest = {...}` |
 | `scriptArgs` | the chunk's own `...`, as `local scriptArgs = { ... }` |
@@ -83,6 +91,8 @@ JavaScript module the build loads.
 | `import("./shop")` | `G.import("src/shop")` — the bundle's `require`, wrapped |
 | `a ?? b` | `if a ~= nil then a else b` for a name; otherwise a function that reads `a` once |
 | `n++` / `n--` | `n += 1` / `n -= 1` |
+| `s + t`, `s += t` with a string on a side | `s .. t`, `s ..= t` |
+| `a + b` where only the values can say — `any`, `string \| number` | `tilua_add(a, b)`: joins if either is a string, else adds |
 | `"key" in t` | `(t["key"] ~= nil)` |
 | `v instanceof Dog` | `tilua_instanceof(v, Dog)` — walks `v.ClassObject`, then each `.ParentClass` |
 | `{ a: 1, get b() { … }, set b(v) { … } }` | `tilua_accessors({ a = 1 }, { b = … }, { b = … })` — a metatable runs the accessors |
