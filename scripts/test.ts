@@ -1456,6 +1456,25 @@ await lowers("a rest parameter is the varargs, named",
     ])
 }
 
+// A static is set once the class is whole, top to bottom, as in TypeScript:
+// one may build an instance, and a later one may read an earlier one.
+runs("class: statics run after the methods and `new`, in order", await compile([
+    "class Vec {",
+    "    static zero = Vec.new(0, 0)",
+    "    static unit = Vec.zero:plus(Vec.new(1, 1))",
+    "    x: number",
+    "    y: number",
+    "    constructor(x: number, y: number) {",
+    "        this.x = x",
+    "        this.y = y",
+    "    }",
+    "    function plus(other: Vec): Vec {",
+    "        return Vec.new(this.x + other.x, this.y + other.y)",
+    "    }",
+    "}",
+    "print(Vec.zero.x, Vec.unit.y)",
+].join("\n")) as BundleResult, ["0\t1"])
+
 // The memory model, as the language promises it: an instance points at its
 // class, a class points at the one it extends, and nothing is copied per
 // instance. Only running it can show that.

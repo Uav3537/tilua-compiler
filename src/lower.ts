@@ -1633,6 +1633,9 @@ end
             ? luau.local([declare], [create])
             : luau.assign([self], [create])]
 
+        // The statics are set once the class is whole, top to bottom, as in
+        // TypeScript: `static zero = Vec.new(0, 0)` needs `new` already there.
+        const statics: L.Statement[] = []
         const previous = this.classContext
         this.classContext = node
         try {
@@ -1642,7 +1645,7 @@ end
                         // Only a static holds a value here; an instance field
                         // is assigned per instance, in `__init`.
                         if (member.isStatic) {
-                            out.push(luau.assign([luau.member(self, member.name.name)],
+                            statics.push(luau.assign([luau.member(self, member.name.name)],
                                 [member.init ? this.expression(member.init) : luau.nil()]))
                         }
                         break
@@ -1667,6 +1670,7 @@ end
             // through its `__init`; it has no `new` of its own.
             if (!node.isAbstract) out.push(this.classNew(node, self))
             out.push(luau.callStatement(luau.call(luau.identifier(accessors), [self])))
+            out.push(...statics)
         } finally {
             this.classContext = previous
         }
