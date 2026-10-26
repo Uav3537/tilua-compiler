@@ -3,7 +3,6 @@
  */
 import { resolve } from "node:path"
 import { findConfig, loadConfig, nodeHost, type ConfigProblem, type OutputMode, type TiluaConfig } from "@tilua/parser"
-import type { Target } from "./lower.js"
 
 /** What `tilua.config.json` holds. */
 export interface TiluaConfigJson {
@@ -15,11 +14,6 @@ export interface TiluaConfigJson {
     baseUrl?: string
     /** A Rojo sourcemap, or `null`. */
     sourceMap?: string | null
-    /** Which Lua the output must run on. `"luau"` (the default) keeps Luau's
-     *  own syntax; `"lua51"` also lowers what stock Lua 5.1 cannot parse —
-     *  `a += b`, `continue`, `if c then a else b` as an expression, `//`,
-     *  digit separators and binary literals. */
-    target?: Target
     /** How many files the output is. `"single"` (the default) is one file;
      *  `"chunks"` also writes a file for what only an `import()` reaches,
      *  loaded when it is first asked for; `"modules"` writes one per module. */
@@ -27,6 +21,8 @@ export interface TiluaConfigJson {
     /** Leave out Lua's standard library — `print`, `string`, `pcall` — which
      *  is otherwise there for every file, as JavaScript's is in TypeScript. */
     noLib?: boolean
+    /** Leave out of the bundle what the entry never reaches (`treeShake`). */
+    treeShaking?: boolean
 }
 
 /** A config file's path, or the config itself. Relative paths — to a config

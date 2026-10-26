@@ -31,7 +31,7 @@
  *     functions.
  */
 import type * as T from "@tilua/parser"
-import type { Binding, BindingId, BuildTarget, ScopeAnalysis, Type, TypeAnalysis } from "@tilua/parser"
+import type { Binding, BindingId, LuaSyntax, ScopeAnalysis, Type, TypeAnalysis } from "@tilua/parser"
 import { formatType } from "@tilua/parser"
 import type * as L from "luau-parser"
 import { parse as parseLuau, parseExpressionFromSource } from "luau-parser"
@@ -88,19 +88,31 @@ export interface LowerOptions {
     /** The file as a library's runtime names it — `src/shop/buy.tilua` —
      *  in the call sites it is handed. */
     readonly file?: string
-    /** Which Lua the output has to run on. Default `"luau"`. `"lua51"` also
-     *  lowers what Luau adds to Lua and 5.1 has no syntax for — `a += b`,
-     *  `continue`, `if c then a else b` as an expression, `//`. */
-    readonly target?: Target
     /** The project leaves Lua's standard library out (`"noLib": true`), so
      *  nothing of it is lowered either. */
     readonly noLib?: boolean
+    /** A bundle's helpers, shared by its modules: each module names the ones
+     *  it uses, and the bundle defines each once. Without it a file defines
+     *  its own. */
+    readonly shared?: SharedRuntime
+    /** Tree shaking (`treeShake`): what of the module is left out, and which
+     *  of the modules it imports do something as they run. */
+    readonly shaken?: {
+        readonly removed: ReadonlySet<object>
+        readonly dead: ReadonlySet<object>
+        /** Does the module `specifier` names run anything as it loads? */
+        runs(specifier: string): boolean
+        /** Is the module `specifier` names needed at all? */
+        needed(specifier: string): boolean
+    }
 }
 
-/** `"luau"` is Roblox's Lua. `"lua51"` is stock Lua 5.1, which has none of
- *  Luau's additions — and no `goto` either, so `continue` has to be built out
- *  of the loops 5.1 does have. */
-export type Target = BuildTarget
+/** The syntax beyond Lua 5.1's that the libraries say the output's Lua has
+ *  (`LoweringPlugin.syntax`). With none, the output is Lua 5.1's syntax, and
+ *  runs on Lua 5.1 to 5.4, LuaJIT and Luau alike. */
+export function syntaxOf(lowerings: readonly LoadedLowering[] | undefined): ReadonlySet<LuaSyntax> {
+    return new Set((lowerings ?? []).flatMap(l => l.plugin.syntax ?? []))
+}
 
 export interface LowerDiagnostic {
     readonly message: string
@@ -122,6 +134,158 @@ export interface LowerResult {
     /** The file reads `scriptArgs`: whatever runs it has to set it up, from
      *  the chunk's own `...` — this file, compiled alone, does it itself. */
     readonly usesScriptArgs: boolean
+    /** With `shared`: the shared helpers the statements name. */
+    readonly shared: readonly string[]
+}
+
+/**
+ * The helpers of a bundle — `tilua_asArray`, the array methods, a library's
+ * runtime — defined once for every module rather than once in each. A
+ * project of forty files that all map over a list would otherwise carry the
+ * array runtime forty times.
+ *
+ * A helper is shared by what it is: the same kind, or a runtime whose Luau
+ * reads the same, gets the same name in every module. One whose Luau differs
+ * from module to module — a runtime reading its own module's line map — is a
+ * helper of its own in each.
+ */
+export class SharedRuntime {
+    private readonly byKey = new Map<string, string>()
+    /** Each group of names and the statements that declare them as locals,
+     *  in the order they were first defined: each after what it uses. */
+    private readonly definitions: { names: string[]; statements: L.Statement[] }[] = []
+    private readonly defined = new Set<string>()
+
+    constructor(private readonly names: Names) {}
+
+    /** The name the helper `key` goes by, in every module. */
+    name(key: string, base: string): string {
+        let name = this.byKey.get(key)
+        if (!name) {
+            name = this.names.fresh(base)
+            this.byKey.set(key, name)
+        }
+        return name
+    }
+
+    /** `statements` declare `names`. Only the first module to say so is heard:
+     *  the others' are the same. */
+    define(names: string[], statements: L.Statement[]): void {
+        if (names.every(name => this.defined.has(name))) return
+        for (const name of names) this.defined.add(name)
+        this.definitions.push({ names, statements })
+    }
+
+    /** Tree shaking: leave out of each runtime table the members nothing
+     *  reads. `code` is everything else the output holds — the modules —
+     *  and a member is read when it, or a member read already, names it:
+     *  `tilua_array.filter(xs, f)` keeps `filter`, and whatever `filter`
+     *  itself calls. A table used as anything but `table.member` — handed
+     *  on, walked, indexed by what only the running program knows — keeps
+     *  every member. */
+    shake(code: readonly L.Statement[]): void {
+        const names = new Set(this.definitions.flatMap(group => group.names))
+        const read = new Map<string, Set<string> | "all">()
+        const use = (name: string, key?: string): void => {
+            const now = read.get(name)
+            if (now === "all") return
+            if (key === undefined) {
+                read.set(name, "all")
+                return
+            }
+            read.set(name, (now ?? new Set()).add(key))
+        }
+        const isRead = (name: string, key: string): boolean => {
+            const now = read.get(name)
+            return now === "all" || (now?.has(key) ?? false)
+        }
+        const scan = (value: unknown): void => {
+            if (!value || typeof value !== "object") return
+            if (Array.isArray(value)) return void value.forEach(scan)
+            const node = value as { type?: string; [key: string]: unknown }
+            const object = node.object as { type?: string; name?: string } | undefined
+            if (object?.type === "Identifier" && names.has(object.name!)) {
+                if (node.type === "MemberExpression") return use(object.name!, (node.property as L.Identifier).name)
+                if (node.type === "MethodCallExpression") {
+                    use(object.name!, (node.method as L.Identifier).name)
+                    return scan(node.arguments)
+                }
+                if (node.type === "IndexExpression") {
+                    const index = node.index as { type?: string; value?: unknown }
+                    if (index.type === "StringLiteral") return use(object.name!, String(index.value))
+                }
+            }
+            if (node.type === "Identifier" && names.has(node.name as string)) return use(node.name as string)
+            // `local function tilua_x()` declares the name; it does not read it.
+            if (node.type === "LocalFunctionStatement") return scan(node.func)
+            for (const [key, child] of Object.entries(node)) {
+                if (key !== "line" && key !== "column") scan(child)
+            }
+        }
+        /** The member a runtime's top-level statement defines: `function
+         *  t.key()` or `t.key = value`. */
+        const defines = (statement: L.Statement, own: readonly string[]): { name: string; key: string; value: unknown } | undefined => {
+            if (statement.type === "FunctionDeclarationStatement") {
+                const target = statement.target
+                if (own.includes(target.base.name) && target.path.length === 1 && !target.method) {
+                    return { name: target.base.name, key: target.path[0].name, value: statement.func }
+                }
+            }
+            if (statement.type === "AssignmentStatement" && statement.targets.length === 1 && statement.values.length === 1) {
+                const target = statement.targets[0] as { type: string; object?: { type?: string; name?: string }; property?: L.Identifier; index?: { type?: string; value?: unknown } }
+                if (target.object?.type === "Identifier" && own.includes(target.object.name!)) {
+                    if (target.type === "MemberExpression") return { name: target.object.name!, key: target.property!.name, value: statement.values[0] }
+                    if (target.type === "IndexExpression" && target.index?.type === "StringLiteral") {
+                        return { name: target.object.name!, key: String(target.index.value), value: statement.values[0] }
+                    }
+                }
+            }
+            return undefined
+        }
+
+        scan(code)
+        const scanned = new Set<L.Statement>()
+        let more = true
+        while (more) {
+            more = false
+            for (const group of this.definitions) {
+                for (const statement of group.statements) {
+                    if (scanned.has(statement)) continue
+                    const definition = defines(statement, group.names)
+                    if (definition && !isRead(definition.name, definition.key)) continue
+                    scanned.add(statement)
+                    more = true
+                    scan(definition ? definition.value : statement)
+                }
+            }
+        }
+        for (const group of this.definitions) {
+            group.statements = group.statements.filter(statement => {
+                const definition = defines(statement, group.names)
+                return !definition || isRead(definition.name, definition.key)
+            })
+        }
+    }
+
+    /** Luau setting up the helpers `used` for a chunk whose code names them:
+     *  `declare` goes before that code, which reads each as an upvalue, and
+     *  `define` after it — before any of it runs, and after what a helper
+     *  reads as it is set up (the line map). Each definition runs in a
+     *  function of its own, so what it keeps to itself stays there. */
+    chunk(used: ReadonlySet<string>): { declare: L.Statement[]; define: L.Statement[] } {
+        const groups = this.definitions.filter(group => group.names.some(name => used.has(name)))
+        const all = groups.flatMap(group => group.names)
+        const declare: L.Statement[] = []
+        for (let i = 0; i < all.length; i += 100) declare.push(luau.local(all.slice(i, i + 100), []))
+        const define = groups.map(group => luau.assign(
+            group.names.map(name => luau.identifier(name)),
+            [luau.call(luau.parenthesized(luau.functionExpression(luau.functionBody([], [
+                ...group.statements,
+                luau.returns(group.names.map(name => luau.identifier(name))),
+            ]))), [])],
+        ))
+        return { declare, define }
+    }
 }
 
 /** How a module's exports behave at runtime, beyond what its code assigns. */
@@ -174,7 +338,7 @@ function visitBlocks(node: unknown): void {
 /** A runtime helper the output needs, emitted once at the top of the file.
  *  `assign` and `concat` are the language's own (spreads); a `lowering` is a
  *  table a type library asked for, by the key it gave it. */
-type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors" | "add" | { lowering: number; runtime: string }
+type Helper = "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "unpack" | "each" | "instanceof" | "accessors" | "add" | { lowering: number; runtime: string }
 
 type Mode = "declare" | "assign"
 
@@ -182,6 +346,11 @@ class Lowerer {
     private readonly names: Names
     private readonly diagnostics: LowerDiagnostic[] = []
     private readonly helpers = new Map<Helper, string>()
+    /** The shared helpers this file names. */
+    private readonly sharedUsed = new Set<string>()
+    /** While a shared helper is written: it is defined outside every module,
+     *  where none of a module's own names shadows a global. */
+    private rawGlobals = false
     /** The binding each declaration node creates. */
     private readonly bindingByDeclaration = new Map<object, Binding>()
     /** tilua names that are Luau keywords, and what they are called instead. */
@@ -197,8 +366,8 @@ class Lowerer {
     private tryFrames: TryFrame[] = []
     /** The loops being lowered in the current function, innermost last. */
     private loops: LoopFrame[] = []
-    /** Whether the output has to be plain Lua 5.1 rather than Luau. */
-    private readonly lua51: boolean
+    /** What the output's Lua can write beyond Lua 5.1 (`syntaxOf`). */
+    private readonly syntax: ReadonlySet<LuaSyntax>
     /** The source line each emitted statement came from. */
     readonly origins = new WeakMap<L.Statement, number>()
 
@@ -207,7 +376,7 @@ class Lowerer {
         private readonly scopes: ScopeAnalysis,
         private readonly options: LowerOptions,
     ) {
-        this.lua51 = options.target === "lua51"
+        this.syntax = syntaxOf(options.lowerings)
         this.names = options.names ? options.names.fork() : Names.from(source)
         this.exportsName = this.names.fresh("exports")
         for (const binding of scopes.bindings.values()) {
@@ -241,16 +410,20 @@ class Lowerer {
         const scriptArgs = this.usesScriptArgs && !this.options.module
             ? [luau.local(["scriptArgs"], [this.array(luau.table([{ type: "TableFieldPositional", value: vararg() }]))])]
             : []
+        this.rawGlobals = this.options.shared !== undefined
         const helpers = this.helperDefinitions()
+        const classes = this.classRuntimeStatements()
+        this.rawGlobals = false
         // Captured before any of the file's code runs — before its own `table`.
         const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
         return {
-            statements: [...captured, ...helpers, ...scriptArgs, ...this.classRuntimeStatements(), ...body],
+            statements: [...captured, ...helpers, ...scriptArgs, ...classes, ...body],
             exportsName: this.exportsName,
             module: this.info,
             diagnostics: this.diagnostics,
             origins: this.origins,
             usesScriptArgs: this.usesScriptArgs,
+            shared: [...this.sharedUsed],
         }
     }
 
@@ -290,6 +463,7 @@ class Lowerer {
     /** A global the generated code calls — `pairs`, `table`, ... — under a name
      *  the source cannot have shadowed. */
     private builtin(global: string): L.Identifier {
+        if (this.rawGlobals) return luau.identifier(global)
         let local = this.builtins.get(global)
         if (!local) {
             const shadowed = [...this.scopes.bindings.values()].some(b => b.name === global && b.kind !== "global")
@@ -302,17 +476,34 @@ class Lowerer {
 
     /** `table.move`. Lua 5.1 has none, and gets a function that does the same. */
     private move(): L.Expression {
-        return this.lua51 ? this.helper("move") : luau.member(this.builtin("table"), "move")
+        return this.helper("move")
     }
 
-    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "each" | "instanceof" | "accessors" | "add"): L.Identifier {
+    private helper(kind: "assign" | "concat" | "arrays" | "array" | "typeof" | "move" | "unpack" | "each" | "instanceof" | "accessors" | "add"): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
             // `tilua_array` is the array methods' own table.
-            name = this.names.fresh(`tilua_${kind === "array" ? "asArray" : kind}`)
+            name = this.sharedName(`helper:${kind}`, `tilua_${kind === "array" ? "asArray" : kind}`)
             this.helpers.set(kind, name)
         }
         return luau.identifier(name)
+    }
+
+    /** A fresh name for a helper — in a bundle, the one every module calls
+     *  that helper by. */
+    private sharedName(key: string, base: string): string {
+        const shared = this.options.shared
+        if (!shared) return this.names.fresh(base)
+        const name = shared.name(key, base)
+        this.names.take(name)
+        this.sharedUsed.add(name)
+        return name
+    }
+
+    /** `statements` declare `names`: in this file, or once for the bundle. */
+    private define(names: string[], statements: L.Statement[], out: L.Statement[]): void {
+        if (this.options.shared) this.options.shared.define(names, statements)
+        else out.push(...statements)
     }
 
     // `typeof v` tells an array from an object, which Luau cannot: both are
@@ -354,7 +545,9 @@ class Lowerer {
         const key = `${index}:${runtime}`
         let name = this.loweringNames.get(key)
         if (!name) {
-            name = this.names.fresh(`tilua_${runtime.replace(/[^A-Za-z0-9_]/g, "_")}`)
+            // One that reads the line map reads its own module's.
+            const lines = this.lowerings[index].plugin.runtime?.[runtime]?.includes("__LINES__") ? this.options.module?.lines : ""
+            name = this.sharedName(`lowering:${key}:${lines}`, `tilua_${runtime.replace(/[^A-Za-z0-9_]/g, "_")}`)
             this.loweringNames.set(key, name)
             this.loweringUsed.push({ index, runtime, name })
         }
@@ -583,22 +776,28 @@ class Lowerer {
         const runtimes = this.runtimeDefinitions()
         if (this.helpers.has("concat")) this.helper("array")
         if (this.helpers.has("concat")) this.move()
+        const unpack = this.helpers.get("unpack")
+        if (unpack) {
+            // Lua 5.2 moved `unpack` into `table`; 5.1 has only the global.
+            this.define([unpack], parseLuau(
+                `local ${unpack} = ${this.builtin("table").name}.unpack or ${this.builtin("unpack").name}`).body.statements, out)
+        }
         const move = this.helpers.get("move")
         if (move) {
-            out.push(...parseLuau(`
-local function ${move}(from, first, last, at, to)
+            this.define([move], parseLuau(`
+local ${move} = ${this.builtin("table").name}.move or function(from, first, last, at, to)
 	for i = first, last do
 		to[at + i - first] = from[i]
 	end
 	return to
-end`).body.statements)
+end`).body.statements, out)
         }
         const each = this.helpers.get("each")
         if (each) {
             // What Luau's `for _, v in t` does, for Lua 5.1: a table is
             // walked as `next` walks it unless its metatable says how, and
             // a function is already the iterator.
-            out.push(...parseLuau(`
+            this.define([each], parseLuau(`
 local function ${each}(source, ...)
 	if ${this.builtin("type").name}(source) == "function" then
 		return source, ...
@@ -608,7 +807,7 @@ local function ${each}(source, ...)
 		return meta.__iter(source)
 	end
 	return ${this.builtin("next").name}, source
-end`).body.statements)
+end`).body.statements, out)
         }
         const marker = this.helpers.get("array")
         const typeOf = this.helpers.get("typeof")
@@ -616,22 +815,22 @@ end`).body.statements)
             const arrays = this.arrays()
             const own = this.helpers.get("arrays")
             if (own) {
-                out.push(...parseLuau(`local ${own} = ${this.builtin("setmetatable").name}({}, { __mode = "k" })`).body.statements)
+                this.define([own], parseLuau(`local ${own} = ${this.builtin("setmetatable").name}({}, { __mode = "k" })`).body.statements, out)
             }
             if (marker) {
-                out.push(...parseLuau(`
+                this.define([marker], parseLuau(`
 local function ${marker}(t)
 	${arrays}[t] = true
 	return t
-end`).body.statements)
+end`).body.statements, out)
             }
             if (typeOf) {
                 // `known`: what the value's type says a table is. With none,
                 // a table the program made is in the record; an instance of a
                 // class has a metatable; anything else is read by its shape.
-                out.push(...parseLuau(`
+                this.define([typeOf], parseLuau(`
 local function ${typeOf}(value, known)
-	local name = ${this.builtin(this.lua51 ? "type" : "typeof").name}(value)
+	local name = (${this.builtin("typeof").name} or ${this.builtin("type").name})(value)
 	if name ~= "table" then
 		return name
 	end
@@ -648,7 +847,7 @@ local function ${typeOf}(value, known)
 		return "array"
 	end
 	return "object"
-end`).body.statements)
+end`).body.statements, out)
             }
         }
         const add = this.helpers.get("add")
@@ -656,20 +855,20 @@ end`).body.statements)
             // `a + b` where only the values can say whether it joins strings
             // or adds numbers: as TypeScript does, a string on either side
             // makes it a join.
-            out.push(...parseLuau(`
+            this.define([add], parseLuau(`
 local function ${add}(a, b)
 	if ${this.builtin("type").name}(a) == "string" or ${this.builtin("type").name}(b) == "string" then
 		return ${this.builtin("tostring").name}(a) .. ${this.builtin("tostring").name}(b)
 	end
 	return a + b
-end`).body.statements)
+end`).body.statements, out)
         }
         const instanceOf = this.helpers.get("instanceof")
         if (instanceOf) {
             // `v instanceof C`: `v` names its class (`ClassObject`), and
             // each class the one it extends (`ParentClass`); `C` is on that
             // chain or it is not. Only a table can be an instance.
-            out.push(...parseLuau(`
+            this.define([instanceOf], parseLuau(`
 local function ${instanceOf}(value, class)
 	if ${this.builtin("type").name}(value) ~= "table" then
 		return false
@@ -682,14 +881,14 @@ local function ${instanceOf}(value, class)
 		current = current.ParentClass
 	end
 	return false
-end`).body.statements)
+end`).body.statements, out)
         }
         const accessors = this.helpers.get("accessors")
         if (accessors) {
             // An object literal with `get` / `set` members: they live in its
             // metatable, never as keys of its own. A name with a getter and
             // no setter cannot be written.
-            out.push(...parseLuau(`
+            this.define([accessors], parseLuau(`
 local function ${accessors}(target, getters, setters)
 	return ${this.builtin("setmetatable").name}(target, {
 		-- Read by a spread, which copies what the getters give.
@@ -713,14 +912,14 @@ local function ${accessors}(target, getters, setters)
 			${this.builtin("rawset").name}(self, key, value)
 		end,
 	})
-end`).body.statements)
+end`).body.statements, out)
         }
         const assign = this.helpers.get("assign")
         if (assign) {
             // assign(target, ...sources): copy each source's keys into target,
             // in order. An object literal's getters live in its metatable, not
             // among its keys: a spread reads them, as JavaScript's does.
-            out.push(...parseLuau(`
+            this.define([assign], parseLuau(`
 local function ${assign}(target, ...)
 	for i = 1, ${this.builtin("select").name}("#", ...) do
 		local source = (${this.builtin("select").name}(i, ...))
@@ -738,13 +937,13 @@ local function ${assign}(target, ...)
 		end
 	end
 	return target
-end`).body.statements)
+end`).body.statements, out)
         }
-        out.push(...runtimes)
+        for (const { names, statements } of runtimes) this.define(names, statements, out)
         const concat = this.helpers.get("concat")
         if (concat) {
             // concat(...parts): one array holding every part's elements, in order.
-            out.push(luau.localFunction(concat, luau.functionBody([], [
+            this.define([concat], [luau.localFunction(concat, luau.functionBody([], [
                 luau.local(["result"], [this.array(luau.table([]))]),
                 luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
                     luau.local(["part"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
@@ -755,14 +954,14 @@ end`).body.statements)
                     ])),
                 ]),
                 luau.returns([luau.identifier("result")]),
-            ], true)))
+            ], true))], out)
         }
         return out
     }
 
     /** The runtime tables the file's libraries were asked for. */
-    private runtimeDefinitions(): L.Statement[] {
-        const out: L.Statement[] = []
+    private runtimeDefinitions(): { names: string[]; statements: L.Statement[] }[] {
+        const out: { names: string[]; statements: L.Statement[] }[] = []
         for (const { index, runtime, name } of this.loweringUsed) {
             const { plugin, from } = this.lowerings[index]
             const source = plugin.runtime?.[runtime]
@@ -778,11 +977,19 @@ end`).body.statements)
             // there is no bundle and no map: positions stay Luau's own.
             const lines = this.options.module?.lines ?? "nil"
             const fail = this.options.module?.fail ?? "nil"
-            out.push(...parseLuau(source
-                .replace(/__NAME__/g, name)
-                .replace(/__LINES__/g, lines)
-                .replace(/__FAIL__/g, fail)
-                .replace(/__ARRAY__/g, () => this.helper("array").name)).body.statements)
+            const group = {
+                names: [name],
+                statements: parseLuau(source
+                    .replace(/__NAME__/g, name)
+                    .replace(/__LINES__/g, lines)
+                    .replace(/__FAIL__/g, fail)
+                    .replace(/__ARRAYS__/g, () => this.arrays())
+                    .replace(/__ARRAY__/g, () => this.helper("array").name)
+                    .replace(/__JSON__/g, () => this.loweringRuntime(0, "json"))).body.statements,
+            }
+            // The language's JSON goes above the runtimes that name it.
+            if (index === 0 && runtime === "json") out.unshift(group)
+            else out.push(group)
         }
         return out
     }
@@ -800,7 +1007,8 @@ end`).body.statements)
      *    util = require("util")    -- the imports
      *    ...                       -- the rest, in source order */
     private module(context: ModuleContext): L.Statement[] {
-        const statements = this.source.body.statements
+        const shaken = this.options.shaken
+        const statements = shaken ? this.source.body.statements.filter(s => !shaken.removed.has(s)) : this.source.body.statements
         const exportsTable = (): L.Identifier => luau.identifier(this.exportsName)
         const { names, links, stars } = this.info
         const locals: string[] = []
@@ -850,14 +1058,29 @@ end`).body.statements)
             // `import type` exists for the type checker alone: no module is
             // required for it, whatever it names.
             if (statement.type !== "ImportStatement" || statement.isTypeOnly) continue
+            // `import "./setup"` names nothing: the module runs, here.
+            if (!statement.defaultImport && !statement.namespaceImport && !statement.specifiers.length) {
+                const key = resolve(statement.source)
+                if (key !== undefined) load(key)
+                continue
+            }
             const specifiers = [
                 ...(statement.defaultImport ? [{ local: statement.defaultImport, imported: "default" as string | undefined }] : []),
                 ...(statement.namespaceImport ? [{ local: statement.namespaceImport, imported: undefined }] : []),
                 ...statement.specifiers.map(s => ({ local: s.local, imported: s.imported.name as string | undefined })),
             ]
             // A binding read nowhere — say, a type — needs no module.
-            const used = specifiers.filter(s => (this.bindingByDeclaration.get(s.local)?.references.length ?? 0) > 0)
-            if (!used.length) continue
+            const used = specifiers.filter(s => (this.bindingByDeclaration.get(s.local)?.references ?? [])
+                .some(reference => !shaken?.dead.has(reference)))
+            if (!used.length) {
+                // Shaken, a module imported for nothing it exports still
+                // runs, as an ES module does — if it does anything.
+                if (shaken?.runs(statement.source.value)) {
+                    const key = resolve(statement.source)
+                    if (key !== undefined) load(key)
+                }
+                continue
+            }
             const key = resolve(statement.source)
             if (key === undefined) continue
             const local = moduleLocal(key)
@@ -905,6 +1128,8 @@ end`).body.statements)
                     break
                 }
                 case "ExportAllStatement": {
+                    // Shaken, an `export *` nothing reads through brings nothing in.
+                    if (shaken && !shaken.needed(statement.source.value)) break
                     const key = resolve(statement.source)
                     if (key === undefined) break
                     load(key)
@@ -1212,7 +1437,7 @@ end`).body.statements)
                 return this.variableDeclaration(node, "declare")
 
             case "FunctionDeclaration":
-                return [{ ...luau.localFunction(this.name(node.name.name), this.functionBody(node.func)), attributes: this.lua51 ? undefined : node.attributes }]
+                return [{ ...luau.localFunction(this.name(node.name.name), this.functionBody(node.func)), attributes: this.syntax.has("attributes") ? node.attributes : undefined }]
 
             case "FunctionDeclarationStatement":
                 return [this.functionDeclarationStatement(node)]
@@ -1229,7 +1454,7 @@ end`).body.statements)
                 const join = node.operator === "+=" ? this.options.types?.joins.get(node) : undefined
                 if (join === "dynamic") return this.dynamicAddition(node)
                 const operator = join === "concat" ? "..=" : node.operator
-                if (this.lua51) return this.compoundAssignment51(node, operator)
+                if (!this.syntax.has("compoundAssignment")) return this.compoundAssignment51(node, operator)
                 return [{
                     type: "CompoundAssignmentStatement",
                     operator,
@@ -1280,12 +1505,13 @@ end`).body.statements)
                 // condition — and it would read a nil global instead, quietly.
                 // Say so rather than compile something that does not mean what
                 // it says.
-                if (this.lua51 && hasOwnJump(body.statements, "ContinueStatement")) {
+                if (!this.syntax.has("continue") && hasOwnJump(body.statements, "ContinueStatement")) {
                     const hidden = declaredNames(body.statements).filter(name => mentions(condition, name))
                     if (hidden.length) {
                         this.report(node, `'continue' in a 'repeat' whose 'until' reads ${hidden.map(n => `'${n}'`).join(", ")} ` +
-                            "cannot be compiled for Lua 5.1, which has no 'continue' to lower it to. " +
-                            "Move what the condition reads out of the loop body, or use a 'while' loop.")
+                            "cannot be compiled to Lua, which has no 'continue' to lower it to. " +
+                            "Move what the condition reads out of the loop body, or use a 'while' loop — " +
+                            "or load a library whose Lua has 'continue' (\"luau\").")
                     }
                 }
                 return [{ type: "RepeatStatement", body: this.loopBody51(body), condition, ...spanOf(node) }]
@@ -1336,12 +1562,12 @@ end`).body.statements)
                 // An iteration is `[step, state, first]`: the three Luau loops
                 // with, taken out of the array they are.
                 let iterators = form.walks === "iteration"
-                    ? [luau.call(this.builtin("unpack"), [source, luau.number(1), luau.number(3)])]
+                    ? [luau.call(this.helper("unpack"), [source, luau.number(1), luau.number(3)])]
                     : [source]
                 // Luau walks a table handed to `for` itself. Lua 5.1 calls
                 // what it is handed: an array goes through `ipairs`, and
                 // anything else through a function that does what Luau does.
-                if (this.lua51 && form.walks === "values") {
+                if (!this.syntax.has("iteration") && form.walks === "values") {
                     const kind = form.viaIter ? undefined : this.options.types?.typeOf.get(node.iterator)?.kind
                     iterators = [luau.call(kind === "array" || kind === "tuple" ? this.builtin("ipairs") : this.helper("each"), [source])]
                 }
@@ -1532,8 +1758,8 @@ end`).body.statements)
 
     private classRuntime(): { build: string; accessors: string } {
         return (this.classHelpers ??= {
-            build: this.names.fresh("tilua_class"),
-            accessors: this.names.fresh("tilua_accessors"),
+            build: this.sharedName("class:build", "tilua_class"),
+            accessors: this.sharedName("class:accessors", "tilua_accessors"),
         })
     }
 
@@ -1557,7 +1783,8 @@ end`).body.statements)
         // are copied in when the class is made, and one the class writes
         // itself then replaces the copy.
         const metamethods = `{ ${CLASS_METAMETHODS.map(name => `"${name}"`).join(", ")} }`
-        return parseLuau(`
+        const out: L.Statement[] = []
+        this.define([build, accessors], parseLuau(`
 local function ${build}(base, name)
     local class = { __getters = {}, __setters = {} }
     class.__index = class
@@ -1595,7 +1822,8 @@ local function ${accessors}(class)
         rawset(this, key, value)
     end
 end
-`).body.statements
+`).body.statements, out)
+        return out
     }
 
     /** The class being lowered, so `super` knows what to name. */
@@ -1765,7 +1993,7 @@ end
             isMethod,
             func,
             // `@native` and the like are Luau's.
-            attributes: this.lua51 ? undefined : node.attributes,
+            attributes: this.syntax.has("attributes") ? node.attributes : undefined,
             ...spanOf(node),
         }
     }
@@ -2046,7 +2274,7 @@ end
                     if (join === "dynamic") return luau.call(this.helper("add"), [this.keptToOne(left), this.keptToOne(right)])
                 }
                 // Lua 5.1 has no `//`.
-                if (this.lua51 && node.operator === "//") return this.floorDivide(left, right)
+                if (!this.syntax.has("floorDivision") && node.operator === "//") return this.floorDivide(left, right)
                 return luau.binary(node.operator, left, right)
             }
 
@@ -2094,7 +2322,7 @@ end
                 return this.expression(node.expression)
 
             case "IfElseExpression":
-                if (this.lua51) return this.ifElse51(node)
+                if (!this.syntax.has("ifExpression")) return this.ifElse51(node)
                 return {
                     type: "IfElseExpression",
                     clauses: node.clauses.map(c => ({ condition: this.expression(c.condition), body: this.expression(c.body) })),
@@ -2155,7 +2383,7 @@ end
                 : lowered
         }
         const unpack = (value: L.Expression): L.Expression =>
-            luau.call(this.lua51 ? this.builtin("unpack") : luau.member(this.builtin("table"), "unpack"), [value])
+            luau.call(this.helper("unpack"), [value])
         const last = list[list.length - 1]
         if (spreads.length === 1 && last.type === "SpreadElement") {
             return [...list.slice(0, -1).map(a => this.expression(a)), unpack(this.expression(last.argument))]
@@ -2287,7 +2515,7 @@ end
         // would without the `?`.
         // Lua 5.1 has no `if` expression, and `a and b or nil` would lose a
         // `false`: there the function below is the only form.
-        if (!this.lua51 && base.type === "Identifier" && segments.length === 1 && last.type !== "CallExpression" && last.type !== "MethodCallExpression") {
+        if (this.syntax.has("ifExpression") && base.type === "Identifier" && segments.length === 1 && last.type !== "CallExpression" && last.type !== "MethodCallExpression") {
             return {
                 type: "IfElseExpression",
                 clauses: [{ condition: luau.binary("==", base, luau.nil()), body: luau.nil() }],
@@ -2316,7 +2544,7 @@ end
     private nullish(node: T.BinaryExpression): L.Expression {
         const left = this.keptToOne(this.expression(node.left))
         const right = this.keptToOne(this.expression(node.right))
-        if (!this.lua51 && left.type === "Identifier") {
+        if (this.syntax.has("ifExpression") && left.type === "Identifier") {
             return {
                 type: "IfElseExpression",
                 clauses: [{ condition: luau.binary("~=", left, luau.nil()), body: left }],
@@ -2411,14 +2639,22 @@ end
         let target: L.Expression
         if (node.target.type === "MemberExpression" || node.target.type === "IndexExpression") {
             const object = this.expression(node.target.object)
-            const objectName = this.names.fresh("target")
-            before.push(luau.local([objectName], [object]))
-            if (node.target.type === "MemberExpression") {
-                target = luau.member(luau.identifier(objectName), node.target.property.name)
+            const key = node.target.type === "IndexExpression" ? node.target.index : undefined
+            // `this.n += 1`: a name and a fixed key read the same each time.
+            if (object.type === "Identifier" && (key === undefined || key.type === "StringLiteral" || key.type === "NumberLiteral")) {
+                target = key === undefined
+                    ? luau.member(object, (node.target as T.MemberExpression).property.name)
+                    : luau.index(object, this.expression(key))
             } else {
-                const keyName = this.names.fresh("key")
-                before.push(luau.local([keyName], [this.expression(node.target.index)]))
-                target = luau.index(luau.identifier(objectName), luau.identifier(keyName))
+                const objectName = this.names.fresh("target")
+                before.push(luau.local([objectName], [object]))
+                if (node.target.type === "MemberExpression") {
+                    target = luau.member(luau.identifier(objectName), node.target.property.name)
+                } else {
+                    const keyName = this.names.fresh("key")
+                    before.push(luau.local([keyName], [this.expression(node.target.index)]))
+                    target = luau.index(luau.identifier(objectName), luau.identifier(keyName))
+                }
             }
         } else {
             target = this.expression(node.target)
@@ -2443,7 +2679,7 @@ end
      *  done, and breaks for real there. A body with no `continue` is left
      *  exactly as it was. */
     private loopBody51(body: L.Block): L.Block {
-        if (!this.lua51 || !hasOwnJump(body.statements, "ContinueStatement")) return body
+        if (this.syntax.has("continue") || !hasOwnJump(body.statements, "ContinueStatement")) return body
         const flag = hasOwnJump(body.statements, "BreakStatement") ? this.names.fresh("broke") : undefined
         const once = luau.repeatUntil(rewriteOwnJumps(body.statements, flag), luau.boolean(true))
         if (!flag) return luau.block([once])
@@ -2500,7 +2736,7 @@ end
      *  underscores and `0b1010` becomes the decimal it means. A hex literal
      *  keeps its base — 5.1 reads those. */
     private numberRaw(node: T.NumberLiteral): string {
-        if (!this.lua51) return node.raw
+        if (this.syntax.has("numberLiterals")) return node.raw
         if (/^0[bB]/.test(node.raw)) return String(node.value)
         return node.raw.replace(/_/g, "")
     }

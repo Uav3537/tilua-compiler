@@ -38,6 +38,11 @@ export class Names {
         return new Names(new Set(this.taken))
     }
 
+    /** `name`, chosen elsewhere, is not to be chosen again here. */
+    take(name: string): void {
+        this.taken.add(name)
+    }
+
     /** `base`, or `base2`, `base3`, ... — whichever is free first. */
     fresh(base: string): string {
         let name = base

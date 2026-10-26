@@ -1,7 +1,9 @@
 # @tilua/compiler
 
 Compiles a [tilua](https://marketplace.visualstudio.com/search?term=tilua)
-project to one Luau file. Each file is parsed by
+project to one Lua file — Lua that runs on Lua 5.1 to 5.4, LuaJIT and Luau
+alike, or Luau where a library says the project is Luau (see [Lua and
+Luau](#lua-and-luau)). Each file is parsed by
 [`@tilua/parser`](https://www.npmjs.com/package/@tilua/parser), its AST lowered
 to a `luau-parser` AST, and that AST printed by `luau-parser`.
 
@@ -12,7 +14,7 @@ npx tilua src/main.tilua --out build/main.luau
 
 ```
 tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>]
-              [--noCheck] [--target luau|lua51]
+              [--noCheck]
 ```
 
 Every module the entry imports is bundled in. Problems are reported as
@@ -38,7 +40,7 @@ const result = await bundle({
     // A config file's path, or its contents:
     config: { types: ["roblox"], paths: { "@shared/*": ["src/shared/*"] } },
 })
-result.code          // the Luau bundle, unless a module failed
+result.code          // the Lua bundle, unless a module failed
 result.files         // [{ path, code, modules }] — one, unless `output` says otherwise
 result.diagnostics   // { file, line, column, message, category: "syntax" | "module" | "type" | "config" }
 
@@ -56,10 +58,10 @@ JavaScript module the build loads.
 
 ## What becomes what
 
-| tilua | Luau |
+| tilua | Lua |
 |---|---|
 | `const { a, b } = value` | `local a, b = value.a, value.b` |
-| `const [x, ...rest] = list` | `local x = list[1]; local rest = table.move(list, 2, #list, 1, {})` — `{}` written down as an array |
+| `const [x, ...rest] = list` | `local x = list[1]; local rest = tilua_move(list, 2, #list, 1, {})` — `table.move` where the Lua has it; `{}` written down as an array |
 | `const { a = 1 } = t` | `local a = t.a; if a == nil then a = 1 end` |
 | `[1, 2]` / `{ a: 1, b }` | `tilua_asArray({ 1, 2 })` / `{ a = 1, b = b }` — see `typeof` below |
 | `typeof v` | `tilua_typeof(v)`, or `tilua_typeof(v, "array")` where `v`'s type already says which table it is |
@@ -99,22 +101,33 @@ JavaScript module the build loads.
 | `x as T`, `x satisfies T`, types, `interface`, `export type { … }`, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
 
-## Lua 5.1
+## Lua and Luau
 
-`"target": "lua51"` (or `--target lua51`) writes what stock Lua 5.1 runs. On
-top of the table above:
+The compiler knows Lua. What it writes is Lua 5.1's syntax, and runs on Lua
+5.1 to 5.4, LuaJIT and Luau alike: `table.move`, `table.unpack` and `typeof`
+are used where the Lua has them and stood in for where it does not.
 
-| Luau | Lua 5.1 |
-|---|---|
-| `a += b`, `a // b`, `continue`, `if c then a else b`, `1_000`, `0b101` | assignments, `math.floor`, a `break` out of a one-pass `repeat`, `and`/`or` or a call, plain numbers |
-| `for _, item in xs do` | `ipairs(xs)` where `xs` is an array by its type; otherwise `tilua_each(xs)`, which walks a table as Luau would — its `__iter` if it has one, `next` if not |
-| `if a == nil then nil else a.b` (`a?.b`) | the function form, which keeps a `false` |
-| `table.move`, `table.unpack` | `tilua_move`, `unpack` |
-| `@native` and other attributes | dropped |
+A Lua with more syntax is a type library's to say — its lowering lists it
+(`syntax`, see [What a type library lowers](#what-a-type-library-lowers)). `@tilua-types/luau` says
+Luau's, and `@tilua-types/roblox` loads it, so a Roblox project is written as
+Luau without asking:
 
-An object's `freeze` does nothing there and `isFrozen` answers `false`: Lua 5.1
-cannot freeze a table. `npm test` with `LUA51` naming a Lua 5.1 interpreter
-builds a program for both targets and checks they print the same.
+| written | Lua (no library) | Luau (`"types": ["luau"]`, or `["roblox"]`) |
+|---|---|---|
+| `a += b`, `a // b` | `a = a + (b)`, `math.floor(a / (b))` | as written |
+| `continue` | a `break` out of a one-pass `repeat` | as written |
+| `c ? a : b`, `a?.b`, `a ?? b` | `and`/`or` where neither arm can be `false`, else a function called on the spot | `if c then a else b` |
+| `for (const x in xs)` | `ipairs(xs)` where `xs` is an array by its type; otherwise `tilua_each(xs)`, which walks a table as Luau would — its `__iter` if it has one, `next` if not | `for _, x in xs do` |
+| `1_000`, `0b101` | plain numbers | as written |
+| `@native` and other attributes | dropped | kept |
+| another file of the bundle | `loadfile` | `require` by path |
+
+An object's `freeze` does nothing on a Lua without `table.freeze`, and
+`isFrozen` answers `false`. `npm test` with `LUA51` naming a Lua 5.1
+interpreter builds a program both ways and checks they print the same.
+
+The config's `target` is gone: `"target": "lua51"` is now what every build
+is, and `"luau"` is `"types": ["luau"]`.
 
 ## `typeof`, arrays and objects
 
@@ -249,6 +262,14 @@ declared as). An answer can `prepend` Luau expressions ahead of the written
 arguments. `globalCall` and `globalValue` answer for a global, such as
 `print(x)` or a bare `print`. A runtime can read `__LINES__` to reach the
 bundle's line map, and wraps a new array it answers with in `__ARRAY__(...)`. See the `@tilua/parser` README for the details.
+
+A library for a Lua with more syntax than 5.1's lists it, and the output uses
+it (see [Lua and Luau](#lua-and-luau)):
+
+```js
+export default { syntax: ["compoundAssignment", "continue", "ifExpression", "floorDivision",
+    "iteration", "attributes", "numberLiterals", "requireByPath"] }
+```
 The standard library's own lowering (src/standard.ts) is written with these
 hooks too; `"noLib": true` leaves it out with the library.
 
@@ -334,6 +355,32 @@ Modules follow ES module rules, including when they import each other:
   loaded by calling it. The path is a string literal; the module it names is
   part of the bundle like any other.
 
+## Tree shaking
+
+`"treeShaking": true` in `tilua.config.json` (or `bundle({ treeShaking })`)
+leaves out of the bundle what the entry never reaches:
+
+- **Declarations nothing reads.** A top-level function, class or `const`
+  that nothing kept reads, and whose value costs nothing to leave unmade — a
+  literal, a function, a class whose statics are not calls. A `const` made by
+  a call stays: the call is something the module does.
+- **Exports nothing imports.** `import { a }` reads `a`, `M.a` reads `a` of
+  `import * as M`, and anything else done with `M` — or `import("./x")` —
+  reads every export. `export { a } from` and `export * from` pass a read on;
+  the entry's exports are always read.
+- **Modules nothing needs.** A module none of whose exports are read, and
+  that does nothing as it runs, is not bundled. One that does something —
+  prints, registers, connects — still runs where it is imported, as an ES
+  module does, even if nothing it exports is read.
+- **Runtime functions nothing calls.** The language's and the libraries'
+  runtime tables keep the members the program calls, and what those call:
+  `xs:map(f):join(",")` brings `map` and `join`, not the rest of the array
+  methods.
+
+Off by default: what is left out is decided from the code, and code that
+reaches a module by a name only the running program knows — `G.require` of a
+string built at runtime — is not something it can see.
+
 ## Several files
 
 `"output"` in `tilua.config.json` (or `--output`, or `bundle({ output })`)
@@ -373,12 +420,12 @@ that file, once, the first time one of its modules is asked for — by an
 `import()`, or by an `import` statement in a module that was itself loaded
 late. So a file costs nothing until then.
 
-How a file is loaded is the one thing the two targets do not share:
+How a file is loaded depends on the Lua (see [Lua and Luau](#lua-and-luau)):
 
-| `target` | loads a file with |
+| Lua | loads a file with |
 |---|---|
-| `"luau"` | `require("./main_src_shop")(G)` — Luau's `require` by path, read from the entry's own file. In Roblox each file is a ModuleScript beside the entry's |
-| `"lua51"` | `loadfile(folder .. "main_src_shop.luau")()(G)`, where `folder` is the entry's own, read off `debug.getinfo` |
+| any | `loadfile(folder .. "main_src_shop.luau")()(G)`, where `folder` is the entry's own, read off `debug.getinfo` |
+| Luau (`requireByPath`) | `require("./main_src_shop")(G)` — `require` by path, read from the entry's own file. In Roblox each file is a ModuleScript beside the entry's |
 
 Either way the files have to stay where they were written, relative to the
 entry's.

@@ -27,6 +27,8 @@ const implemented = (source: string): Set<string> =>
 const array = read("array.luau")
 const string = read("string.luau")
 const object = read("object.luau")
+// `__JSON__` in a library's runtime: JSON that knows `[]` from `{}`.
+const json = read("json.luau")
 const arrayMethods = implemented(array)
 const stringMethods = implemented(string)
 const objectMethods = implemented(object)
@@ -74,7 +76,7 @@ function objectKeys(type: Type | undefined): { known: string; open: string } {
 }
 
 const plugin: LoweringPlugin = {
-    runtime: { array, string, object },
+    runtime: { array, string, object, json },
 
     methodCall({ method, receiver, use }) {
         if (isString(receiver)) {

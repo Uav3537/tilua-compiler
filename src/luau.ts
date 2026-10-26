@@ -37,8 +37,11 @@ export const methodCall = (object: L.Expression, method: string, args: L.Express
 export const functionExpression = (func: L.FunctionBody): L.FunctionExpression =>
     ({ type: "FunctionExpression", func, ...span() })
 
+/** In Luau `^` binds tighter than a unary operator on its left — `#xs ^ 2`
+ *  is `#(xs ^ 2)` — and the printer does not know, so the unary one is
+ *  bracketed here. */
 export const binary = (operator: L.BinaryExpression["operator"], left: L.Expression, right: L.Expression): L.BinaryExpression =>
-    ({ type: "BinaryExpression", operator, left, right, ...span() })
+    ({ type: "BinaryExpression", operator, left: operator === "^" && left.type === "UnaryExpression" ? parenthesized(left) : left, right, ...span() })
 
 export const unary = (operator: L.UnaryExpression["operator"], argument: L.Expression): L.UnaryExpression =>
     ({ type: "UnaryExpression", operator, argument, ...span() })

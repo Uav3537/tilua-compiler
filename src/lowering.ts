@@ -25,7 +25,7 @@ import type { LoweringPlugin } from "@tilua/parser"
 // written against it with `import type { LoweringPlugin } from "@tilua/parser"`
 // — without depending on the compiler that calls it.
 export type {
-    LoweringPlugin, MethodCall, MethodLowering, GlobalCall, GlobalValue, CallLowering, CallSite, ArgumentInfo,
+    LoweringPlugin, LuaSyntax, MethodCall, MethodLowering, GlobalCall, GlobalValue, CallLowering, CallSite, ArgumentInfo,
 } from "@tilua/parser"
 
 export interface LoadedLowering {

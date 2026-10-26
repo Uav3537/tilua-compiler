@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  *   tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>]
- *                 [--noCheck] [--target luau|lua51]
+ *                 [--noCheck]
  *
- * Bundles `entry` and every module it imports into one Luau file — by default
+ * Bundles `entry` and every module it imports into one Lua file — by default
  * the entry's path with `.luau` — and reports problems as
  * `file:line:column message`. Exits with 1 when there were errors; type errors
  * still produce the bundle.
@@ -17,15 +17,14 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { basename, dirname, join, relative, resolve } from "node:path"
 import { bundle } from "./bundle.js"
 import { resolveConfig } from "./config.js"
-import type { BuildTarget, OutputMode } from "@tilua/parser"
+import type { OutputMode } from "@tilua/parser"
 
-const usage = "usage: tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>] [--noCheck] [--target luau|lua51]"
+const usage = "usage: tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>] [--noCheck]"
 const args = process.argv.slice(2)
 let entry: string | undefined
 let out: string | undefined
 let config: string | undefined
 let typeCheck = true
-let buildTarget: BuildTarget | undefined
 let output: OutputMode | undefined
 for (let i = 0; i < args.length; i++) {
     const arg = args[i]
@@ -33,12 +32,10 @@ for (let i = 0; i < args.length; i++) {
     else if (arg === "--config") config = args[++i]
     else if (arg === "--noCheck") typeCheck = false
     else if (arg === "--target") {
-        const value = args[++i]
-        if (value !== "luau" && value !== "lua51") {
-            console.error(`--target must be 'luau' or 'lua51', not '${value}'`)
-            process.exit(2)
-        }
-        buildTarget = value
+        // The output is Lua that runs anywhere; a library says what more.
+        console.error("--target is gone: the output runs on Lua 5.1 to 5.4, LuaJIT and Luau, "
+            + "and a library says what more its Lua has — add \"luau\" to the config's 'types'")
+        process.exit(2)
     }
     else if (arg === "--output") {
         const value = args[++i]
@@ -69,7 +66,7 @@ async function main(from: string): Promise<never> {
     const folder = entryFile !== undefined ? dirname(entryFile) : out ?? found?.directory ?? dirname(from)
 
     const result = await bundle({
-        entry: from, config, typeCheck, target: buildTarget, output: mode,
+        entry: from, config, typeCheck, output: mode,
         outFile: entryFile !== undefined ? basename(entryFile) : undefined,
     })
     for (const d of result.diagnostics) {

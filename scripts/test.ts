@@ -1,10 +1,12 @@
 /**
  * @tilua/compiler tests.
  *
- * Lowering cases compile a fragment and compare the Luau it prints, with the
+ * Lowering cases compile a fragment and compare the Lua it prints, with the
  * printer's line breaks folded into spaces so a case reads on one line. Every
  * output is parsed back with luau-parser: whatever lowering builds must be
- * valid Luau.
+ * valid Luau — and, without a library that says its Lua has more, valid Lua
+ * 5.1 too. Luau's own syntax is tested with a library that says so, built
+ * here (`LUAU`), as `@tilua-types/luau` is.
  *
  * Bundle cases build a small project on disk. When a Luau interpreter is
  * available — `luau` on the PATH, or the `LUAU` environment variable naming
@@ -19,7 +21,7 @@ import { parse as parseLuau, print as printLuau } from "luau-parser"
 import { parse as parseTilua, analyzeScopes as analyzeScopesTilua, analyzeTypes as analyzeTypesTilua } from "@tilua/parser"
 import { bundle, compile, type BundleResult } from "../src/index.js"
 import { lower } from "../src/lower.js"
-import type { LoweringPlugin } from "../src/lowering.js"
+import type { LoadedLowering, LoweringPlugin, LuaSyntax } from "../src/lowering.js"
 import * as luau from "../src/luau.js"
 
 let passed = 0
@@ -111,6 +113,7 @@ async function lowers(name: string, source: string, expected: string): Promise<v
         return
     }
     validLuau(name, result.code)
+    validLua51(name, result.code)
     check(name, unmarked(flat(result.code)), expected)
 }
 
@@ -125,11 +128,39 @@ async function lowersMarked(name: string, source: string, expected: string): Pro
     check(name, flat(result.code), expected)
 }
 
-/** Lower `source` for stock Lua 5.1 and check its output, on one line. */
+/** Everything Luau writes beyond Lua 5.1, as `@tilua-types/luau` says it. */
+const LUAU_SYNTAX: LuaSyntax[] = [
+    "compoundAssignment", "continue", "ifExpression", "floorDivision", "iteration", "attributes", "numberLiterals", "requireByPath",
+]
+const LUAU_LOWERING: LoadedLowering = { plugin: { syntax: LUAU_SYNTAX }, from: "luau" }
+
+/** A type library like `@tilua-types/luau`: no types, and the syntax. A
+ *  config names it by its path — `{ types: [LUAU] }`. */
+const LUAU = (() => {
+    const folder = mkdtempSync(join(tmpdir(), "tilua-luau-"))
+    writeFileSync(join(folder, "package.json"), JSON.stringify({ name: "luau-syntax", tilua: { types: "index.d.tilua", lowering: "lowering.mjs" } }))
+    writeFileSync(join(folder, "index.d.tilua"), "")
+    writeFileSync(join(folder, "lowering.mjs"), `export default { syntax: ${JSON.stringify(LUAU_SYNTAX)} }\n`)
+    return folder
+})()
+
+/** As `lowers`, for Luau: with a library that says its Lua has Luau's syntax. */
+async function lowersLuau(name: string, source: string, expected: string): Promise<void> {
+    const result = await compile(source, { types: [LUAU] })
+    if (result.code === undefined) {
+        failures.push(`${name}\n    did not compile: ${result.diagnostics.map(d => `${d.line}:${d.column} ${d.message}`).join("; ")}`)
+        return
+    }
+    validLuau(name, result.code)
+    check(name, unmarked(flat(result.code)), expected)
+}
+
+/** Lower `source` and check its output, on one line — as `lowers`, and the
+ *  output must also be Lua 5.1, which it is without a library saying more. */
 function lowers51(name: string, source: string, expected: string): void {
     const program = parseTilua(source)
     const scopes = analyzeScopesTilua(program)
-    const result = lower(program, scopes, { target: "lua51", types: analyzeTypesTilua(program, scopes, { diagnostics: false }) })
+    const result = lower(program, scopes, { types: analyzeTypesTilua(program, scopes, { diagnostics: false }) })
     if (result.diagnostics.length) {
         failures.push(`${name}\n    did not lower: ${result.diagnostics.map(d => d.message).join("; ")}`)
         return
@@ -140,10 +171,10 @@ function lowers51(name: string, source: string, expected: string): void {
     check(name, unmarked(flat(code)), expected)
 }
 
-/** The Lua 5.1 lowering refuses `source`, saying `reason`. */
+/** Lowering refuses `source`, saying `reason`. */
 function refuses51(name: string, source: string, reason: string): void {
     const program = parseTilua(source)
-    const result = lower(program, analyzeScopesTilua(program), { target: "lua51" })
+    const result = lower(program, analyzeScopesTilua(program), {})
     check(name, result.diagnostics.map(d => d.message.includes(reason)), [true])
 }
 
@@ -152,8 +183,9 @@ await lowers("const and let are local", "const a = 1\nlet b = 2", "local a = 1; 
 await lowers("a declaration without a value", "let x", "local x;")
 await lowers("types are dropped", "type P = { x: number }\ndeclare game: unknown\nconst n: number = 1 as number", "local n = 1;")
 await lowers("satisfies and as const are dropped", "const t = { a: 1 } satisfies { a: number }\nconst u = [1] as const", "local t = { a = 1 }; local u = { 1 };")
-// --- the Lua 5.1 target -----------------------------------------------------
-// Stock 5.1 has none of Luau's additions, and no `goto` to lower `continue` to.
+// --- Lua 5.1's syntax, the default ---------------------------------------------
+// What the compiler writes runs on Lua 5.1 to 5.4, LuaJIT and Luau: 5.1 has
+// none of Luau's additions, and no `goto` to lower `continue` to.
 {
     lowers51("lua51: compound assignment expands", "let a = 1\na += 2", "local a = 1; a = a + (2);")
     lowers51("lua51: concat assignment expands", "let s = \"a\"\ns += \"b\"", "local s = \"a\"; s = s .. (\"b\");")
@@ -186,7 +218,7 @@ await lowers("satisfies and as const are dropped", "const t = { a: 1 } satisfies
     // hide them, so that one combination is refused rather than miscompiled.
     refuses51("lua51: a repeat whose condition reads a body local is refused",
         "let n = 0\nrepeat {\n  const step = 1\n  n += step\n  if (n == 1) { continue }\n} until (n >= 3 and step == 1)",
-        "cannot be compiled for Lua 5.1")
+        "cannot be compiled to Lua")
     lowers51("lua51: a repeat whose condition reads nothing from the body is fine",
         "let n = 0\nrepeat {\n  n += 1\n  if (n == 1) { continue }\n} until (n >= 3)",
         "local n = 0; repeat repeat n = n + (1); if n == 1 then break; end; until true; until n >= 3;")
@@ -228,7 +260,7 @@ await lowers("methods read with `.`, and length",
 await lowers("a function a table holds is called as it is",
     "const t = { f: (n: number) => n }\nprint(t.f(1))",
     "local t = { f = function(n) return n; end }; print((t.f(1)));")
-await lowers("array rest", "const [head, ...tail] = list", "local head = list[1]; local tail = table.move(list, 2, #list, 1, {});")
+await lowers("array rest", "const [head, ...tail] = list", "local tilua_move = table.move or function(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; local head = list[1]; local tail = tilua_move(list, 2, #list, 1, {});")
 
 // --- destructuring assignment ----------------------------------------------------
 await lowers("assigns straight from a name", "let a = 1\nlet b = 2\n{ a, b } = value", "local a = 1; local b = 2; a, b = value.a, value.b;")
@@ -246,7 +278,7 @@ await lowers("object spread copies in order",
     `local function tilua_assign(target, ...) for i = 1, select("#", ...) do local source = (select(i, ...)); if source ~= nil then for key, value in pairs(source) do target[key] = value; end; local meta = type(source) == "table" and getmetatable(source) or nil; local getters = type(meta) == "table" and rawget(meta, "__tiluaGetters") or nil; if getters ~= nil then for key, get in pairs(getters) do target[key] = get(source); end; end; end; end; return target; end; local t = tilua_assign({}, { a = 1 }, base, { b = 2 });`)
 await lowers("array spread joins the runs",
     "const xs = [f(), ...ys, g()]",
-    `local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { g() });`)
+    `local tilua_move = table.move or function(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; local function tilua_concat(...) local result = {}; for i = 1, select("#", ...) do local part = select(i, ...); tilua_move(part, 1, #part, #result + 1, result); end; return result; end; local xs = tilua_concat({ (f()) }, ys, { g() });`)
 // Luau only calls a method on a string in parentheses; tilua lets it go bare.
 await lowers("a method call on a bare string gets its parentheses",
     `const a = "a":upper():rep(2)
@@ -269,12 +301,15 @@ await lowers("function expressions", "const f = function(a = 2) { return a }", "
 
 // --- statements and names --------------------------------------------------------
 await lowers("for-in patterns", "const list = [{ name: \"a\" }]\nfor (const { name } in list) {\n    print(name)\n}",
-    'local list = { { name = "a" } }; for _, item in list do local name = item.name; print(name); end;')
-await lowers("if expressions", "const v = if a then 1 elseif b then 2 else 3", "local v = if a then 1 elseif b then 2 else 3;")
+    'local list = { { name = "a" } }; for _, item in ipairs(list) do local name = item.name; print(name); end;')
+await lowers("if expressions", "const v = if a then 1 elseif b then 2 else 3", "local v = (a and 1 or (b and 2 or 3));")
+await lowersLuau("luau: if expressions are Luau's own", "const v = if a then 1 elseif b then 2 else 3", "local v = if a then 1 elseif b then 2 else 3;")
 await lowers("a Luau keyword used as a name", "let local = 1\nprint(t.local, local)", `local local_ = 1; print(t["local"], local_);`)
 await lowers("generated names avoid the source's", "const ref = 1\nconst { a } = f()", "local ref = 1; local ref2 = f(); local a = ref2.a;")
 
 await lowers("a table is walked for its values", "const list = [1, 2]\nfor (const v in list) { print(v) }",
+    "local list = { 1, 2 }; for _, v in ipairs(list) do print(v); end;")
+await lowersLuau("luau: a table is walked by Luau itself", "const list = [1, 2]\nfor (const v in list) { print(v) }",
     "local list = { 1, 2 }; for _, v in list do print(v); end;")
 await lowers("an optional read of a key stops the chain",
     "declare maps: { [string]: { label: string } } | nil\ndeclare key: string\nconst named = maps?.[key]?.label",
@@ -284,15 +319,16 @@ await lowers("an iterator function is the loop's own",
     "declare step: () => number | nil\nfor (const n in step) { print(n) }", "for n in step do print(n); end;")
 await lowers("an iteration is the three Luau loops with, taken out of the array it is",
     "declare walk: [(s: nil, previous: number | nil) => number | nil, nil, nil]\nfor (const n in walk) { print(n) }",
-    "for n in unpack(walk, 1, 3) do print(n); end;")
-await lowers("what follows a return, break or continue is left out",
+    "local tilua_unpack = table.unpack or unpack; for n in tilua_unpack(walk, 1, 3) do print(n); end;")
+await lowersLuau("what follows a return, break or continue is left out",
     "function f(x: number): number {\n    if (x > 1) {\n        return 1\n        print(\"dead\")\n    }\n    return x\n    print(x)\n}\nfor (i = 1, 3) {\n    if (i == 2) {\n        continue\n        print(i)\n    }\n    break\n    print(i)\n}",
     "local function f(x) if x > 1 then return 1; end; return x; end; for i = 1, 3 do if i == 2 then continue; end; break; end;")
 await lowers("a module's code after its return is left out", "print(1)\nreturn\nconst y = 2\nprint(y)", "print(1); return;")
-await lowers("attributes are kept","@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
+await lowers("attributes are Luau's, and left out", "@native\nfunction f(x: number): number {\n    return x\n}", "local function f(x) return x; end;")
+await lowersLuau("luau: attributes are kept","@native\nfunction f(x: number): number {\n    return x\n}", "@native local function f(x) return x; end;")
 await lowers("a shadowed global the output needs is captured first",
     "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
-    `local tilua_table = table; local table = {}; local a = list[1]; local rest = tilua_table.move(list, 2, #list, 1, {}); print((("%s"):format(tostring(a))));`)
+    `local tilua_table = table; local tilua_move = tilua_table.move or function(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; local table = {}; local a = list[1]; local rest = tilua_move(list, 2, #list, 1, {}); print((("%s"):format(tostring(a))));`)
 
 check("a parse error leaves no output",
     ((r: { code?: string; diagnostics: unknown[] }) => [r.code, r.diagnostics.length > 0])(await compile("const = 1")), [undefined, true])
@@ -345,7 +381,9 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
 // function asking the values where they cannot, and `+` for numbers.
 await lowers("+ joins strings and adds numbers",
     "const s = \"a\"\nconst n = 1\nconst j = s + n + \"!\"\nconst k = n + n\nlet t = \"\"\nt += s",
-    "local s = \"a\"; local n = 1; local j = (s .. n) .. \"!\"; local k = n + n; local t = \"\"; t ..= s;")
+    "local s = \"a\"; local n = 1; local j = (s .. n) .. \"!\"; local k = n + n; local t = \"\"; t = t .. (s);")
+await lowersLuau("luau: += that joins is ..=",
+    "let t = \"\"\nt += \"s\"", "local t = \"\"; t ..= \"s\";")
 await lowers("+ with a side only the values can tell asks them",
     "function f(v: string | number) { return v + 1 }",
     "local function tilua_add(a, b) if type(a) == \"string\" or type(b) == \"string\" then return tostring(a) .. tostring(b); end; return a + b; end; local function f(v) return (tilua_add(v, 1)); end;")
@@ -856,7 +894,7 @@ function fails(name: string, result: BundleResult, message: string): void {
     })
     const result = await bundle({ entry: join(root, "main.tilua") })
     check("an iteration is looped with as its three parts",
-        result.code?.includes("for item in unpack(walk, 1, 3) do"), true)
+        result.code?.includes("for item in tilua_unpack(walk, 1, 3) do"), true)
     runs("an iteration walks what its steps answer", result, ["1a", "2b"])
 }
 
@@ -965,8 +1003,11 @@ function fails(name: string, result: BundleResult, message: string): void {
             "leaf\tnil",
         ])
     const code = (await bundle({ entry: join(root, "main.tilua"), config: { types: [] } })).code ?? ""
-    check("bundle: an optional read on a name is an `if` expression",
-        code.includes("if root == nil then nil else root.name"), true)
+    check("bundle: an optional read on a name is a call, which any Lua has",
+        code.includes("if root == nil then nil else root.name"), false)
+    const forLuau = (await bundle({ entry: join(root, "main.tilua"), config: { types: [LUAU] } })).code ?? ""
+    check("luau: an optional read on a name is an `if` expression",
+        forLuau.includes("if root == nil then nil else root.name"), true)
 }
 
 // What a call means is the type library's to say: the compiler asks, the
@@ -1209,13 +1250,13 @@ function findLuau(): string | undefined {
 // otherwise.
 await lowers("a spread argument last is Lua's own expansion",
     "declare xs: number[]\nf(1, ...xs)",
-    "f(1, table.unpack(xs));")
+    "local tilua_unpack = table.unpack or unpack; f(1, tilua_unpack(xs));")
 await lowers("a spread anywhere else builds the list first",
     "declare xs: number[]\nf(...xs, 1)",
-    "local function tilua_concat(...) local result = {}; "
-    + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
+    "local tilua_unpack = table.unpack or unpack; local tilua_move = table.move or function(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; local function tilua_concat(...) local result = {}; "
+    + "for i = 1, select(\"#\", ...) do local part = select(i, ...); tilua_move(part, 1, #part, #result + 1, result); end; "
     + "return result; end; "
-    + "f(table.unpack(tilua_concat(xs, { 1 })));")
+    + "f(tilua_unpack(tilua_concat(xs, { 1 })));")
 // `...[a, b]` is the Luau pack `a, b`, written out rather than unpacked.
 await lowers("a spread array literal is its values",
     "f(...[1, 2])\nf(0, ...[1, ...[2, 3]], 4)",
@@ -1225,10 +1266,10 @@ await lowers("a spread literal's last call keeps every value when it ends the li
     "f(1, g()); f(g(), 1);")
 await lowers("a spread literal's last call anywhere else stays an array",
     "f(...[1, g()], 2)",
-    "local function tilua_concat(...) local result = {}; "
-    + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
+    "local tilua_unpack = table.unpack or unpack; local tilua_move = table.move or function(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; local function tilua_concat(...) local result = {}; "
+    + "for i = 1, select(\"#\", ...) do local part = select(i, ...); tilua_move(part, 1, #part, #result + 1, result); end; "
     + "return result; end; "
-    + "f(table.unpack(tilua_concat({ 1 }, { g() }, { 2 })));")
+    + "f(tilua_unpack(tilua_concat({ 1 }, { g() }, { 2 })));")
 await lowers("a spread array literal in an array is its values",
     "const xs = [0, ...[1, 2], 3]",
     "local xs = { 0, 1, 2, 3 };")
@@ -1584,7 +1625,7 @@ await lowers("class: the simple case is the plain Lua idiom",
     + "class.__newindex = function(this, key, value) local setter = class.__setters[key]; if setter ~= nil then setter(this, value); return; end; rawset(this, key, value); end; "
     + "end; "
     + "local Counter = tilua_class(nil, \"Counter\"); "
-    + "function Counter.bump(this) this.n += 1; return this.n; end; "
+    + "function Counter.bump(this) this.n = this.n + (1); return this.n; end; "
     + "function Counter.__init(this, ...) this.n = 0; end; "
     + "function Counter.new(...) local this = setmetatable({}, Counter); Counter.__init(this, ...); return this; end; "
     + "tilua_accessors(Counter);")
@@ -1681,12 +1722,12 @@ await lowersMarked("typeof: an array is written down as one where it is made",
     const code = flat(lowered.code ?? "")
     check("typeof: a call of the runtime, told what the type already says", [
         lowered.diagnostics.map(d => d.message),
-        code.includes("local function tilua_typeof(value, known) local name = typeof(value);"),
+        code.includes("local function tilua_typeof(value, known) local name = (typeof or type)(value);"),
         code.includes("tilua_asArray({ tilua_typeof(v), tilua_typeof(a, \"array\"), tilua_typeof(o, \"object\") })"),
     ], [[], true, true])
     const program = parseTilua("const k = typeof v")
-    const lua51 = flat(printLuau(luau.program(lower(program, analyzeScopesTilua(program), { target: "lua51" }).statements)))
-    check("typeof: Lua 5.1 has only `type`", lua51.includes("local name = type(value);"), true)
+    const code51 = flat(printLuau(luau.program(lower(program, analyzeScopesTilua(program), {}).statements)))
+    check("typeof: Luau's `typeof` where there is one, and `type` elsewhere", code51.includes("local name = (typeof or type)(value);"), true)
 }
 // One record for the whole bundle: an array another module made is one here.
 {
@@ -1805,7 +1846,9 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
     const plain = await bundle({ entry: join(project({ "main.tilua": `import { a } from "./a"\nprint(a)\n`, "a.tilua": `export const a = 1\n` }), "main.tilua"), config: { types: [] } })
     check("import(): a bundle that writes none has no wrapper", plain.code?.includes("import = function"), false)
 
-    const chunks = await bundle({ entry, output: "chunks", outFile: "game.luau" })
+    // Luau loads another file with `require` by path; the interpreter these
+    // run on is Luau's, which has no `loadfile`.
+    const chunks = await bundle({ entry, output: "chunks", outFile: "game.luau", root, config: { types: [LUAU] } })
     check("chunks: what only an import() reaches gets a file, and what two share another",
         chunks.files.map(f => [f.path, f.modules]), [
             ["game.luau", ["src/main", "src/util"]],
@@ -1820,7 +1863,7 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
         chunks.files[1]?.code.startsWith("return function(G)"), true)
     check("chunks: the same program", runFiles("chunks: the same program", chunks, luauBinary) ?? expected, expected)
 
-    const modules = await bundle({ entry, output: "modules" })
+    const modules = await bundle({ entry, output: "modules", root, config: { types: [LUAU] } })
     check("modules: a file for each, in the project's tree", modules.files.map(f => f.path),
         ["src/main.luau", "src/util.luau", "src/shop/buy.luau", "src/extra.luau", "src/side.luau", "src/shop/tax.luau"])
     check("modules: named from the entry's own file", modules.code?.includes(`["src/shop/tax"] = "./shop/tax"`), true)
@@ -1829,9 +1872,11 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
     const configured = await bundle({ entry: join(project({ ...files, "tilua.config.json": JSON.stringify({ types: [], output: "chunks" }) }), "src/main.tilua") })
     check("output: the config's, without an option", configured.files.length, 5)
 
+    // Without a library saying more, another file is loaded with
+    // `loadfile`, which every Lua but Luau has.
     const lua51Binary = process.env.LUA51
     for (const output of ["single", "chunks", "modules"] as const) {
-        const built = await bundle({ entry, output, target: "lua51" })
+        const built = await bundle({ entry, output })
         check(`lua51: ${output}, loaded with loadfile`, output === "single" || built.code?.includes("loadfile(folder .. file)"), true)
         if (lua51Binary) check(`lua51: ${output} runs`, runFiles(`lua51: ${output} runs`, built, lua51Binary), expected)
     }
@@ -1845,7 +1890,7 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
         "src/shop/broken.tilua": `export function fail(inner: any) {\n    return inner.value\n}\n`,
     })
     for (const output of ["chunks", "modules"] as const) {
-        const ran = runFiles(`${output}: an error in another file`, await bundle({ entry: join(root, "src/main.tilua"), output }), luauBinary)
+        const ran = runFiles(`${output}: an error in another file`, await bundle({ entry: join(root, "src/main.tilua"), output, root, config: { types: [LUAU] } }), luauBinary)
         if (ran) {
             check(`${output}: an error in another file names the project's`, ran.slice(0, 4), [
                 "src/shop/broken.tilua:2: attempt to index nil with 'value'",
@@ -1876,14 +1921,14 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
 // --- Lua 5.1 at runtime -------------------------------------------------------------
 //
 // Valid Lua 5.1 is not yet Lua 5.1 that runs: `for _, v in list do` parses, and
-// then calls a table. So what the lowering leaves to Luau itself is looked at
-// here as text, and — with `LUA51` naming a Lua 5.1 interpreter — the same
-// program is built for both targets and has to print the same thing on each.
+// then calls a table. So what a Lua with Luau's syntax would do itself is
+// looked at here as text, and — with `LUA51` naming a Lua 5.1 interpreter —
+// the same program, built for Lua and for Luau, has to print the same thing.
 {
     // Which it is, the types say: without them every table goes the long way.
     const program = parseTilua("const list = [1, 2]\nfor (const v in list) { print(v) }")
     const scopes = analyzeScopesTilua(program)
-    const result = lower(program, scopes, { target: "lua51", types: analyzeTypesTilua(program, scopes) })
+    const result = lower(program, scopes, { types: analyzeTypesTilua(program, scopes) })
     check("lua51: an array is walked with ipairs", unmarked(flat(printLuau(luau.program(result.statements)))),
         "local list = { 1, 2 }; for _, v in ipairs(list) do print(v); end;")
 }
@@ -1894,10 +1939,11 @@ lowers51("lua51: any other table is walked as Luau would walk it", "declare t: {
 lowers51("lua51: an optional read is a call, not an `if` expression", "declare a: { b: boolean } | nil\nconst v = a?.b",
     "local v = (function() local ref = a; if ref == nil then return nil; end; return ref.b; end)();")
 lowers51("lua51: attributes are Luau's, and are dropped", "@native\nfunction f(x: number) { return x }", "local function f(x) return x; end;")
-lowers51("lua51: a rest element is copied without table.move", "declare list: number[]\nconst [head, ...tail] = list",
-    "local function tilua_move(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; "
+lowers51("lua51: a rest element is copied with table.move where there is one", "declare list: number[]\nconst [head, ...tail] = list",
+    "local tilua_move = table.move or function(from, first, last, at, to) for i = first, last do to[at + i - first] = from[i]; end; return to; end; "
     + "local head = list[1]; local tail = tilua_move(list, 2, #list, 1, {});")
-lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[]) => nil\ndeclare xs: number[]\nf(1, ...xs)", "f(1, unpack(xs));")
+lowers51("lua51: a spread argument is `unpack`, wherever the Lua keeps it", "declare f: (...args: number[]) => nil\ndeclare xs: number[]\nf(1, ...xs)",
+    "local tilua_unpack = table.unpack or unpack; f(1, tilua_unpack(xs));")
 
 {
     const root = project({
@@ -1955,8 +2001,8 @@ lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[])
         ].join("\n"),
     })
     const entry = join(root, "main.tilua")
-    const forLuau = await bundle({ entry, config: { types: [] } })
-    const forLua51 = await bundle({ entry, config: { types: [] }, target: "lua51" })
+    const forLuau = await bundle({ entry, config: { types: [LUAU] } })
+    const forLua51 = await bundle({ entry, config: { types: [] } })
     if (forLua51.code !== undefined) validLua51("lua51: the language at runtime", forLua51.code)
     const expected = run("lua51: the same program, for Luau", forLuau)
     const lua51Binary = process.env.LUA51
@@ -2048,9 +2094,126 @@ lowers51("lua51: a spread argument is `unpack`", "declare f: (...args: number[])
         check("bundle: TypeScript's operators, interfaces and accessors", output.slice(0, expected.length), expected)
         check("bundle: a getter with no setter cannot be written", output[expected.length]?.startsWith("false\t") && output[expected.length].includes("has a getter and no setter"), true)
     }
-    const forLua51 = await bundle({ entry, config: { types: [] }, target: "lua51" })
+    const forLua51 = await bundle({ entry, config: { types: [] } })
     if (forLua51.code !== undefined) validLua51("lua51: TypeScript's operators, interfaces and accessors", forLua51.code)
     else failures.push(`lua51: TypeScript's operators, interfaces and accessors\n    no bundle: ${forLua51.diagnostics.map(d => d.message).join("; ")}`)
+}
+
+// In Luau `^` binds tighter than a unary operator: `#xs ^ 2` is `#(xs ^ 2)`.
+await lowers("^: a length or a negation on its left is bracketed",
+    "const xs = [1, 2]\nconst n = 3\nprint(xs.length ^ 2.5, (-n) ^ 2, -n ^ 2, 2 ^ -n)",
+    "local xs = { 1, 2 }; local n = 3; print((#xs) ^ 2.5, (-n) ^ 2, -n ^ 2, 2 ^ -n);")
+
+// `import "./x"` runs the module, in its place among the imports, and names nothing.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [] }),
+        "src/main.tilua": `import "./setup"\nimport { value } from "./value"\nprint("main", value)\n`,
+        "src/setup.tilua": `print("setup")\n`,
+        "src/value.tilua": `print("value")\nexport const value = 1\n`,
+    })
+    runs("import \"...\": the module runs, before the ones imported after it",
+        await bundle({ entry: join(root, "src/main.tilua") }), ["setup", "value", "main\t1"])
+}
+
+// A helper is defined once for the bundle, not once in each module that uses it.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [] }),
+        "src/main.tilua": [
+            `import { a } from "./a"`,
+            `import { b } from "./b"`,
+            `class K { n = 1 }`,
+            `print([1, 2]:map(x => x * 2):join(","), typeof [1], a(), b(), K.new().n)`,
+            `print(import("./c").c())`,
+        ].join("\n"),
+        "src/a.tilua": `export function a() { class P {}\n return [3]:filter(y => y > 1).length + typeof {} }\n`,
+        "src/b.tilua": `export function b() { return [3]:map(y => y):join("") }\n`,
+        "src/c.tilua": `export function c() { return [5]:map(y => y + 1):join("") }\n`,
+    })
+    const entry = join(root, "src/main.tilua")
+    const expected = ["2,4\tarray\t1object\t3\t1", "6"]
+    const single = await bundle({ entry })
+    runs("shared helpers: a bundle that runs as before", single, expected)
+    const count = (code: string, text: string): number => code.split(text).length - 1
+    check("shared helpers: each defined once",
+        ["local tilua_array = {}", "local function tilua_asArray(", "local function tilua_typeof(", "local function tilua_class("].map(text => count(single.code ?? "", text)),
+        [1, 1, 1, 1])
+    for (const output of ["chunks", "modules"] as const) {
+        const result = await bundle({ entry, output, root, config: { types: [LUAU] } })
+        check(`shared helpers (${output}): each file defines what its modules use`, result.files.every(f => f.code.includes("tilua_array = (function()")), true)
+        const ran = runFiles(`shared helpers (${output})`, result, luauBinary)
+        if (ran) check(`shared helpers (${output}): runs as before`, ran, expected)
+    }
+}
+
+// --- tree shaking ----------------------------------------------------------------
+// `"treeShaking": true` leaves out what the entry never reaches: declarations
+// nothing reads, modules nothing reads that do nothing as they run, and the
+// members of a runtime table nothing calls.
+{
+    const files = {
+        "tilua.config.json": JSON.stringify({ types: [], treeShaking: true }),
+        "src/main.tilua": [
+            `import { used, unreadImport } from "./lib"`,
+            `import * as M from "./math"`,
+            `import { quiet } from "./quiet"`,
+            `import { loud } from "./loud"`,
+            `import { again } from "./barrel"`,
+            `import "./setup"`,
+            `const xs = [3, 1, 2]`,
+            `print(used(), M.square(3), xs:map(x => x * 2):join(","), again)`,
+            `print(import("./lazy").both())`,
+            `export const out = 1`,
+        ].join("\n"),
+        "src/lib.tilua": [
+            `export function used() { return helper() + 1 }`,
+            `function helper() { return 41 }`,
+            `export function unused() { return onlyForUnused() }`,
+            `function onlyForUnused() { return 1 }`,
+            `export const unreadImport = 5`,
+            `export const made = make()`,
+            `function make() { print("made"); return 2 }`,
+            `export class Unused { static count = 0 }`,
+            `export class Counted { static count = make() }`,
+        ].join("\n"),
+        "src/math.tilua": `export function square(n: number) { return n * n }\nexport function cube(n: number) { return n * n * n }\n`,
+        "src/quiet.tilua": `export const quiet = 1\n`,
+        "src/loud.tilua": `print("loud runs")\nexport const loud = 1\n`,
+        "src/barrel.tilua": `export { again } from "./deep"\nexport * from "./star"\n`,
+        "src/deep.tilua": `export const again = "again"\nexport const notAgain = 0\n`,
+        "src/star.tilua": `export function starred() { return 0 }\n`,
+        "src/setup.tilua": `print("setup runs")\nexport function setupHelper() { return 0 }\n`,
+        "src/lazy.tilua": `export function both() { return "lazy" }\nexport function also() { return 1 }\n`,
+    }
+    const root = project(files)
+    const entry = join(root, "src/main.tilua")
+    const shaken = await bundle({ entry })
+    const whole = await bundle({ entry, treeShaking: false })
+    const code = shaken.code ?? ""
+    check("tree shaking: what nothing reads is left out", [
+        shaken.diagnostics.map(d => d.message),
+        ["helper", "used", "square", "again", "both", "also", "out"].map(name => code.includes(name)),
+        ["onlyForUnused", "unreadImport", "cube", "notAgain", "starred", "setupHelper", "Unused"].map(name => code.includes(name)),
+        shaken.modules,
+        whole.modules,
+    ], [
+        [],
+        [true, true, true, true, true, true, true],
+        [false, false, false, false, false, false, false],
+        ["src/main", "src/lib", "src/math", "src/loud", "src/barrel", "src/setup", "src/lazy", "src/deep"],
+        ["src/main", "src/lib", "src/math", "src/barrel", "src/setup", "src/lazy", "src/deep", "src/star"],
+    ])
+    check("tree shaking: a runtime table keeps the members called", [
+        code.includes("function tilua_array.map("), code.includes("function tilua_array.join("),
+        code.includes("function tilua_array.filter("), (whole.code ?? "").includes("function tilua_array.filter("),
+    ], [true, true, false, true])
+    // What runs as a module loads still runs: `make()` and the class whose
+    // static calls it, and every module that prints.
+    runs("tree shaking: the program does what it did", shaken, ["made", "made", "loud runs", "setup runs", "42\t9\t6,2,4\tagain", "lazy"])
+    // Unshaken, an import whose names nothing reads brings no module in —
+    // `loud` with it. Shaken, a module that runs anything still runs.
+    runs("tree shaking: unshaken, an import read by nothing loads nothing", whole, ["made", "made", "setup runs", "42\t9\t6,2,4\tagain", "lazy"])
 }
 
 for (const failure of failures) console.log(`FAIL ${failure}`)

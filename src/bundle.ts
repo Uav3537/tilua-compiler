@@ -52,9 +52,10 @@
  *   end
  *
  * `G.files` says which file each of those modules is in, and `require` loads
- * that file — once — the first time one of its modules is asked for. How a
- * file is loaded is the target's: Luau's `require` by path, or Lua 5.1's
- * `loadfile`, both from beside the entry's file. `"chunks"` keeps everything
+ * that file — once — the first time one of its modules is asked for, from
+ * beside the entry's file: with `loadfile`, which every Lua but Luau has, or
+ * with `require` by path where a library says its Lua reads one
+ * (`requireByPath`, as `@tilua-types/luau` does). `"chunks"` keeps everything
  * the entry imports in the entry's file and splits off what only an
  * `import()` reaches; `"modules"` gives every module a file of its own.
  */
@@ -68,7 +69,8 @@ import {
 } from "@tilua/parser"
 import { parse as parseLuau, parseExpressionFromSource, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
-import { lower, type ModuleInfo, type Target } from "./lower.js"
+import { lower, syntaxOf, SharedRuntime, type ModuleInfo } from "./lower.js"
+import { treeShake } from "./treeshake.js"
 import { buildLineMap, lineMapSource, type Origin } from "./linemap.js"
 import { loadLowerings } from "./lowering.js"
 import * as luau from "./luau.js"
@@ -85,11 +87,12 @@ export interface BundleOptions {
     readonly root?: string
     /** Check types against the config's `types` too. Default: true. */
     readonly typeCheck?: boolean
-    /** Which Lua the output must run on. Overrides the config's `target`. */
-    readonly target?: Target
     /** How many files to make. Overrides the config's `output`; `"single"`
      *  without either. */
     readonly output?: OutputMode
+    /** Leave out what the entry never reaches. Overrides the config's
+     *  `treeShaking`; off without either. */
+    readonly treeShaking?: boolean
     /** What the entry's file is called: `main.luau`. The other files of
      *  `"chunks"` are named after it (`main_shop.luau`), and every file takes
      *  its extension. Default: the entry's own name, with `.luau`. */
@@ -197,11 +200,24 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const requireExpression = luau.member(luau.identifier(G), "require")
     const importExpression = luau.member(luau.identifier(G), "import")
     const mode: OutputMode = options.output ?? config?.output ?? "single"
-    const target: Target = options.target ?? config?.target ?? "luau"
+    // Another file of the output is loaded with `require` where the
+    // libraries say their Lua reads a path, and with `loadfile` elsewhere.
+    const byPath = syntaxOf(lowerings).has("requireByPath")
     const modules = new Map<string, LoweredModule>()
     // Where every emitted statement was written, across all the modules. The
     // bundle is one file, so this is the only way back to the project.
     const origins = new WeakMap<LuauStatement, Origin>()
+    // Each helper once for the bundle, not once in every module that uses it.
+    const shared = new SharedRuntime(names)
+    // What the entry never reaches is left out, when the project asks.
+    const shaking = options.treeShaking ?? config?.treeShaking ?? false
+    const resolveIn = (file: string) => (specifier: string): string | undefined => {
+        const found = resolveModulePath(file, specifier, config)
+        return found !== undefined && sources.has(found) ? found : undefined
+    }
+    const shaken = shaking
+        ? treeShake([...sources.values()].map(s => ({ file: s.file, program: s.program, scopes: s.scopes, resolve: resolveIn(s.file) })), entry)
+        : undefined
     const pending = [entry]
     while (pending.length) {
         const file = pending.shift()!
@@ -214,10 +230,21 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
             names,
             types: analysis.types.get(file),
             lowerings,
-            target,
             noLib: config?.noLib,
             source: source.text,
             file: shown,
+            shared,
+            shaken: shaken && {
+                ...shaken.modules.get(file)!,
+                runs: specifier => {
+                    const target = resolveIn(file)(specifier)
+                    return target !== undefined && shaken.sideEffects.has(target)
+                },
+                needed: specifier => {
+                    const target = resolveIn(file)(specifier)
+                    return target !== undefined && shaken.required.has(target)
+                },
+            },
             module: {
                 name: source.name,
                 require: requireExpression,
@@ -248,6 +275,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
             exportsName: lowered.exportsName,
             info: lowered.module,
             usesScriptArgs: lowered.usesScriptArgs,
+            shared: lowered.shared,
             imports,
             dynamicImports,
         })
@@ -281,18 +309,21 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         return { files: [], modules: moduleNames, diagnostics }
     }
 
+    // The runtime tables too, member by member: what the modules read.
+    if (shaking) shared.shake(lowered.flatMap(m => m.statements))
+
     const several = mode !== "single"
     const layout = layoutOf(mode, modules.get(entry)!, lowered, options.outFile)
     const usesScriptArgs = lowered.some(m => m.usesScriptArgs)
     /** What `load` is handed for each module that is not in the entry's file. */
     const elsewhere = new Map<string, string>()
     for (const file of layout.slice(1)) {
-        for (const module of file.modules) elsewhere.set(module.name, loadPath(layout[0].path, file.path, target))
+        for (const module of file.modules) elsewhere.set(module.name, loadPath(layout[0].path, file.path, byPath))
     }
 
     const program = parseLuau(runtime(G, {
         several,
-        target,
+        byPath,
         files: elsewhere,
         imports: lowered.some(m => m.dynamicImports.size > 0),
     }))
@@ -312,6 +343,9 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     for (const module of layout[0].modules) {
         modulesTable.fields.push({ type: "TableFieldComputed", key: luau.string(module.name), value: moduleTable(module) })
     }
+    // The helpers the file's modules name are upvalues of them all.
+    const helpers = shared.chunk(new Set(layout[0].modules.flatMap(m => m.shared)))
+    program.body.statements.unshift(...helpers.declare)
     // The entry runs under `xpcall`, so an error nothing caught — `nil.x`, an
     // `error` of the author's — is reported in the project's files rather than
     // as a line of this bundle, and only then raised.
@@ -340,12 +374,15 @@ ${modules.get(entry)!.info.exports ? `return ${result}` : ""}
         if (several) mapStatements.push(...mapRegistration(G, layout[0], `${G}.lines`))
         program.body.statements.splice(program.body.statements.length - entryStatements.length, 0, ...mapStatements)
     }
+    // Set up once the map is there, which a helper may read as it is.
+    program.body.statements.splice(program.body.statements.length - entryStatements.length, 0, ...helpers.define)
 
     const files: BundleFile[] = [{ path: layout[0].path, code: print(program) + "\n", modules: layout[0].modules.map(m => m.name) }]
     for (const file of layout.slice(1)) {
         // Every other file: a function that adds its modules to the table it
         // is handed. It has no locals of its own for a module to trip over.
-        const body: LuauStatement[] = []
+        const fileHelpers = shared.chunk(new Set(file.modules.flatMap(m => m.shared)))
+        const body: LuauStatement[] = [...fileHelpers.declare]
         if (file.modules.some(m => m.usesScriptArgs)) body.push(...parseLuau(`local scriptArgs = ${G}.scriptArgs`).body.statements)
         for (const module of file.modules) {
             body.push(luau.assign(
@@ -356,7 +393,7 @@ ${modules.get(entry)!.info.exports ? `return ${result}` : ""}
         const chunk = luau.program([luau.returns([luau.functionExpression(luau.functionBody([G], body))])])
         // As in the entry's file: the map goes after everything it describes.
         const lines = buildLineMap(chunk, parseLuau(print(chunk)), origins)
-        body.push(...mapRegistration(G, file, lineMapSource(lines)))
+        body.push(...mapRegistration(G, file, lineMapSource(lines)), ...fileHelpers.define)
         files.push({ path: file.path, code: print(chunk) + "\n", modules: file.modules.map(m => m.name) })
     }
 
@@ -370,6 +407,8 @@ interface LoweredModule {
     readonly exportsName: string
     readonly info: ModuleInfo
     readonly usesScriptArgs: boolean
+    /** The bundle's shared helpers it names. */
+    readonly shared: readonly string[]
     /** Modules it needs before it can run: `import`, `export ... from`. */
     readonly imports: Set<string>
     /** Modules an `import()` in it names: needed when that runs, if it does. */
@@ -462,12 +501,12 @@ function layoutOf(mode: OutputMode, entry: LoweredModule, modules: readonly Lowe
 }
 
 /** What the entry's `load` is handed to load `file`: where it is from the
- *  entry's own file, as the target's loader names a file. */
-function loadPath(entryPath: string, file: string, target: Target): string {
+ *  entry's own file, as the loader names a file. */
+function loadPath(entryPath: string, file: string, byPath: boolean): string {
     const path = posix.relative(posix.dirname(entryPath), file)
-    // Lua 5.1 reads the file itself, so it is named in full.
-    if (target === "lua51") return path
-    // Luau's `require` takes a path that says where it starts and has no extension.
+    // `loadfile` reads the file itself, so it is named in full.
+    if (!byPath) return path
+    // `require` takes a path that says where it starts and has no extension.
     const bare = path.slice(0, path.length - posix.extname(path).length)
     return bare.startsWith("../") ? bare : `./${bare}`
 }
@@ -492,18 +531,20 @@ interface RuntimeOptions {
     /** The output is more than one file can be: `require` loads the file a
      *  module is in, and an error's position may be in any of them. */
     readonly several: boolean
-    readonly target: Target
+    /** Another file is loaded with `require` by path, not `loadfile`. */
+    readonly byPath: boolean
     /** What `load` is handed for each module outside the entry's file. */
     readonly files: ReadonlyMap<string, string>
     /** Some module writes `import()`. */
     readonly imports: boolean
 }
 
-/** How the entry's file loads another of the output's files: the one thing
- *  here that Luau and Lua 5.1 do not have in common. Both read it from beside
- *  the entry's file, and both get back the function the file is. */
-function loader(G: string, target: Target): string {
-    if (target === "lua51") {
+/** How the entry's file loads another of the output's files: `loadfile`,
+ *  which every Lua has, or `require` by path where the libraries say their
+ *  Lua reads one. Both read it from beside the entry's file, and both get
+ *  back the function the file is. */
+function loader(G: string, byPath: boolean): string {
+    if (!byPath) {
         return `
         -- From beside this file, wherever that is: its own path says where.
         local folder = ""
@@ -519,7 +560,7 @@ function loader(G: string, target: Target): string {
         end
         chunk()(${G})`
     }
-    // Luau's \`require\` reads a path from the file that calls it: this one.
+    // \`require\` reads a path from the file that calls it: this one.
     return `
         require(file)(${G})`
 }
@@ -714,7 +755,7 @@ ${several ? `
         if ${G}.loaded[file] then
             return
         end
-        ${G}.loaded[file] = true${loader(G, options.target)}
+        ${G}.loaded[file] = true${loader(G, options.byPath)}
     end,` : ""}${options.imports ? `
     -- \`import("./x")\`: the module's exports, asked for where the code runs
     -- rather than before its module does. \`require\` does the rest — and

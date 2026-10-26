@@ -61,7 +61,6 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
         types: analyzeTypes(program, scopes, { libs, noLib, diagnostics: false }),
         noLib,
         lowerings,
-        target: resolved?.target,
         source,
     })
     diagnostics.push(...lowered.diagnostics)
