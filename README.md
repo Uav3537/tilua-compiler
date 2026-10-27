@@ -74,9 +74,10 @@ JavaScript module the build loads.
 | `const` / `let` | `local` |
 | `class C { … }` | one table for the class, one per instance — see below |
 | `return [a, b]` | `return { a, b }` — several results are an array |
-| `for (const item in xs)` | `for _, item in xs do … end` — an array or a table walked for its values |
-| `for (const item in step)` | `for item in step do … end` — an iterator function |
-| `for (const [k, v] in pairs(t))` | `for item in unpack(pairs(t), 1, 3) do local k, v = item[1], item[2] … end` — an iteration is `[step, state, first]` |
+| `for (const item of xs)` | `for _, item in xs do … end` — an array or a table walked for its values |
+| `for (const item of step)` | `for item in step do … end` — an iterator function |
+| `for (const [k, v] of pairs(t))` | `for item in unpack(pairs(t), 1, 3) do local k, v = item[1], item[2] … end` — an iteration is `[step, state, first]` |
+| `for (const key in t)` | `for key in pairs(t) do … end` — a table's keys, as in TypeScript |
 | `t ??= v` | `if t == nil then t = v end` — what addresses `t` read once, into locals |
 | `{ m() { … } }` | `{ m = function(this) … end }` — called with `:` |
 | `break outer` from a loop inside `outer` | a flag `outer` declares, raised, and a `break`; after each loop on the way out, a check that breaks again — or, at `outer`, does the `break` or `continue` |
@@ -117,7 +118,7 @@ Luau without asking:
 | `a += b`, `a // b` | `a = a + (b)`, `math.floor(a / (b))` | as written |
 | `continue` | a `break` out of a one-pass `repeat` | as written |
 | `c ? a : b`, `a?.b`, `a ?? b` | `and`/`or` where neither arm can be `false`, else a function called on the spot | `if c then a else b` |
-| `for (const x in xs)` | `ipairs(xs)` where `xs` is an array by its type; otherwise `tilua_each(xs)`, which walks a table as Luau would — its `__iter` if it has one, `next` if not | `for _, x in xs do` |
+| `for (const x of xs)` | `ipairs(xs)` where `xs` is an array by its type; otherwise `tilua_each(xs)`, which walks a table as Luau would — its `__iter` if it has one, `next` if not | `for _, x in xs do` |
 | `1_000`, `0b101` | plain numbers | as written |
 | `@native` and other attributes | dropped | kept |
 | another file of the bundle | `loadfile` | `require` by path |
@@ -433,12 +434,12 @@ entry's.
 <!-- compatibility:start -->
 ## Compatibility
 
-`@tilua/compiler@7.0.1` works with these tilua packages. *Released with* is the
+`@tilua/compiler@8.0.0` works with these tilua packages. *Released with* is the
 version it was built and tested against.
 
 | Package | Range | Released with | |
 | --- | --- | --- | --- |
-| `@tilua/parser` | `^7.0.0` | 7.0.0 | dependency |
+| `@tilua/parser` | `^8.0.0` | 8.0.0 | dependency |
 <!-- compatibility:end -->
 
 ## Development

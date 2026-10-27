@@ -300,25 +300,29 @@ await lowers("methods keep ':' and drop the injected self",
 await lowers("function expressions", "const f = function(a = 2) { return a }", "local f = function(a) if a == nil then a = 2; end; return a; end;")
 
 // --- statements and names --------------------------------------------------------
-await lowers("for-in patterns", "const list = [{ name: \"a\" }]\nfor (const { name } in list) {\n    print(name)\n}",
+await lowers("for-in patterns", "const list = [{ name: \"a\" }]\nfor (const { name } of list) {\n    print(name)\n}",
     'local list = { { name = "a" } }; for _, item in ipairs(list) do local name = item.name; print(name); end;')
 await lowers("if expressions", "const v = if a then 1 elseif b then 2 else 3", "local v = (a and 1 or (b and 2 or 3));")
 await lowersLuau("luau: if expressions are Luau's own", "const v = if a then 1 elseif b then 2 else 3", "local v = if a then 1 elseif b then 2 else 3;")
 await lowers("a Luau keyword used as a name", "let local = 1\nprint(t.local, local)", `local local_ = 1; print(t["local"], local_);`)
 await lowers("generated names avoid the source's", "const ref = 1\nconst { a } = f()", "local ref = 1; local ref2 = f(); local a = ref2.a;")
 
-await lowers("a table is walked for its values", "const list = [1, 2]\nfor (const v in list) { print(v) }",
+await lowers("a table is walked for its values", "const list = [1, 2]\nfor (const v of list) { print(v) }",
     "local list = { 1, 2 }; for _, v in ipairs(list) do print(v); end;")
-await lowersLuau("luau: a table is walked by Luau itself", "const list = [1, 2]\nfor (const v in list) { print(v) }",
+await lowers("for ... in: a table's keys, through pairs", "const o = { a: 1, b: 2 }\nfor (const k in o) { print(k, o[k]) }",
+    "local o = { a = 1, b = 2 }; for k in pairs(o) do print(k, o[k]); end;")
+await lowersLuau("luau: for ... in walks keys through pairs too", "const list = [1, 2]\nfor (const i in list) { print(i) }",
+    "local list = { 1, 2 }; for i in pairs(list) do print(i); end;")
+await lowersLuau("luau: a table is walked by Luau itself", "const list = [1, 2]\nfor (const v of list) { print(v) }",
     "local list = { 1, 2 }; for _, v in list do print(v); end;")
 await lowers("an optional read of a key stops the chain",
     "declare maps: { [string]: { label: string } } | nil\ndeclare key: string\nconst named = maps?.[key]?.label",
     "local named = (function() local ref = maps; if ref == nil then return nil; end; ref = ref[key];"
     + " if ref == nil then return nil; end; return ref.label; end)();")
 await lowers("an iterator function is the loop's own",
-    "declare step: () => number | nil\nfor (const n in step) { print(n) }", "for n in step do print(n); end;")
+    "declare step: () => number | nil\nfor (const n of step) { print(n) }", "for n in step do print(n); end;")
 await lowers("an iteration is the three Luau loops with, taken out of the array it is",
-    "declare walk: [(s: nil, previous: number | nil) => number | nil, nil, nil]\nfor (const n in walk) { print(n) }",
+    "declare walk: [(s: nil, previous: number | nil) => number | nil, nil, nil]\nfor (const n of walk) { print(n) }",
     "local tilua_unpack = table.unpack or unpack; for n in tilua_unpack(walk, 1, 3) do print(n); end;")
 await lowersLuau("what follows a return, break or continue is left out",
     "function f(x: number): number {\n    if (x > 1) {\n        return 1\n        print(\"dead\")\n    }\n    return x\n    print(x)\n}\nfor (i = 1, 3) {\n    if (i == 2) {\n        continue\n        print(i)\n    }\n    break\n    print(i)\n}",
@@ -889,7 +893,7 @@ function fails(name: string, result: BundleResult, message: string): void {
             `    if (name == nil) { return nil }`,
             `    return [i, name]`,
             `}, names, nil]`,
-            'for (const [i, name] in walk) { print(`${i}${name}`) }',
+            'for (const [i, name] of walk) { print(`${i}${name}`) }',
         ].join("\n") + "\n",
     })
     const result = await bundle({ entry: join(root, "main.tilua") })
@@ -910,14 +914,14 @@ function fails(name: string, result: BundleResult, message: string): void {
             `let count = 0`,
             // A table is walked as it is. Not `pairs(others)`: with no library
             // that is Luau's own, answering three values where tilua has one.
-            `for (const value in others) { count += 1 }`,
+            `for (const value of others) { count += 1 }`,
             `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
             `function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number {`,
             `    return (a + b) * scale`,
             `}`,
             `const values = [0, ...[1, 2], sum({ a: 1 }), sum({ a: 1, b: 1 }, 2)]`,
             `let total = 0`,
-            `for (const v in values) { total += v }`,
+            `for (const v of values) { total += v }`,
             `const stack = Stack.new()`,
             `stack:push(5)`,
             `const label = if total > 10 then "big" else "small"`,
@@ -1134,6 +1138,18 @@ function fails(name: string, result: BundleResult, message: string): void {
     check("bundle: directives suppress scope and type errors, and an unused expect-error is one",
         loud.diagnostics.map(d => `${d.line}: ${d.message}`),
         ["4: Type '\"x\"' is not assignable to 'number'", "4: Unused '@tilua-expect-error' directive", "5: Unused '@tilua-expect-error' directive"])
+    const linted = await bundle({ entry: join(project({
+        "main.tilua": [
+            `declare n: number`,
+            `--@tilua-expect-warning`,
+            `print(n == "x")`,
+            `--@tilua-expect-warning`,
+            `print(n)`,
+        ].join("\n"),
+    }), "main.tilua"), config: { types: [] } })
+    check("bundle: expect-warning takes a warning, and unused it is a warning",
+        linted.diagnostics.map(d => `${d.line}: ${d.severity ?? "error"}: ${d.message}`),
+        ["4: warning: Unused '@tilua-expect-warning' directive"])
     const unknown = project({
         "main.tilua": `counter = 1\nprint(counter)\nprint(typo)\n`,
         "defs.d.tilua": `declare function print(...args: unknown[]): nil\n`,
@@ -1926,13 +1942,13 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
 // the same program, built for Lua and for Luau, has to print the same thing.
 {
     // Which it is, the types say: without them every table goes the long way.
-    const program = parseTilua("const list = [1, 2]\nfor (const v in list) { print(v) }")
+    const program = parseTilua("const list = [1, 2]\nfor (const v of list) { print(v) }")
     const scopes = analyzeScopesTilua(program)
     const result = lower(program, scopes, { types: analyzeTypesTilua(program, scopes) })
     check("lua51: an array is walked with ipairs", unmarked(flat(printLuau(luau.program(result.statements)))),
         "local list = { 1, 2 }; for _, v in ipairs(list) do print(v); end;")
 }
-lowers51("lua51: any other table is walked as Luau would walk it", "declare t: { [string]: number }\nfor (const v in t) { print(v) }",
+lowers51("lua51: any other table is walked as Luau would walk it", "declare t: { [string]: number }\nfor (const v of t) { print(v) }",
     "local function tilua_each(source, ...) if type(source) == \"function\" then return source, ...; end; "
     + "local meta = getmetatable(source); if meta ~= nil and meta.__iter ~= nil then return meta.__iter(source); end; "
     + "return next, source; end; for _, v in tilua_each(t) do print(v); end;")
@@ -1953,14 +1969,14 @@ lowers51("lua51: a spread argument is `unpack`, wherever the Lua keeps it", "dec
             `const point: Point = { x: 1, y: 2 }`,
             `const { x, y: py = 9, ...others } = { ...point, z: 3, w: 4 }`,
             `let count = 0`,
-            `for (const value in others) { count += value }`,
+            `for (const value of others) { count += value }`,
             `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
             `function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number {`,
             `    return (a + b) * scale`,
             `}`,
             `const values = [0, ...[1, 2], sum({ a: 1 }), sum({ a: 1, b: 1 }, 2)]`,
             `let total = 0`,
-            `for (const v in values) {`,
+            `for (const v of values) {`,
             `    if (v == 2) { continue }`,
             `    total += v`,
             `}`,
@@ -1977,7 +1993,7 @@ lowers51("lua51: a spread argument is `unpack`, wherever the Lua keeps it", "dec
             `    }`,
             `}`,
             `let stepped = 0`,
-            `for (const step in steps(3)) { stepped += step }`,
+            `for (const step of steps(3)) { stepped += step }`,
             `@native`,
             `function half(n: number): number { return n // 2 }`,
             `function all(...parts: number[]): number { return parts.length }`,

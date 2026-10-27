@@ -63,7 +63,7 @@ import { readFileSync, statSync } from "node:fs"
 import { basename, dirname, extname, posix, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries, importExpressions,
-    directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, ParseError, LexError, luauString,
+    directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, UNUSED_EXPECT_WARNING, ParseError, LexError, luauString,
     type ModuleExports, type Program, type ScopeAnalysis, type TiluaConfig, type TypeAnalysis, type Directives,
     type OutputMode,
 } from "@tilua/parser"
@@ -281,11 +281,13 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         })
     }
 
-    // `--@tilua-nocheck`, `--@tilua-ignore` and `--@tilua-expect-error` apply
-    // to scope and type errors, file by file.
+    // `--@tilua-nocheck`, `--@tilua-ignore`, `--@tilua-expect-error` and
+    // `--@tilua-expect-warning` apply to scope and type errors and to
+    // warnings, file by file.
     for (const [file, fileDirectives] of directives) {
         const semantic = diagnostics.filter(d => d.file === file && (d.category === "scope" || d.category === "type"))
-        const { kept, unusedExpectErrors } = applyDirectives(fileDirectives, semantic, d => d.line)
+        const { kept, unusedExpectErrors, unusedExpectWarnings } =
+            applyDirectives(fileDirectives, semantic, d => d.line, d => d.severity === "warning")
         const suppressed = new Set(semantic.filter(d => !kept.includes(d)))
         const remaining = diagnostics.filter(d => !suppressed.has(d))
         diagnostics.length = 0
@@ -294,6 +296,9 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         if (options.typeCheck === false) continue
         for (const d of unusedExpectErrors) {
             diagnostics.push({ file, message: UNUSED_EXPECT_ERROR, line: d.line, column: d.column, category: "type" })
+        }
+        for (const d of unusedExpectWarnings) {
+            diagnostics.push({ file, message: UNUSED_EXPECT_WARNING, line: d.line, column: d.column, category: "type", severity: "warning" })
         }
     }
 

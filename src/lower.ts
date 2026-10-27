@@ -1539,7 +1539,7 @@ end`).body.statements, out)
                 }]
 
             case "GenericForStatement": {
-                // `for (const [a, b] in pairs(t))`: one value each time, which
+                // `for (const [a, b] of pairs(t))`: one value each time, which
                 // a pattern takes apart at the top of the body.
                 const prelude: L.Statement[] = []
                 const variable = declared(node.variable)
@@ -1553,8 +1553,16 @@ end`).body.statements, out)
                 // How the source is walked is the type analysis's call — it
                 // binds the item's type from the same choice, so the name and
                 // its type cannot drift apart.
-                const form = this.options.types?.loops.get(node) ?? { walks: "values" as const, viaIter: false }
+                const form = this.options.types?.loops.get(node)
+                    ?? { walks: node.over === "keys" ? "keys" as const : "values" as const, viaIter: false }
                 let source = this.expression(node.iterator)
+                // `for (const key in t)`: the keys `pairs` gives, the values
+                // left behind — the same in Luau and in Lua 5.1, and never
+                // through an `__iter`, which hands out values.
+                if (form.walks === "keys") {
+                    return [luau.genericFor([item], [luau.call(this.builtin("pairs"), [source])],
+                        this.loopBody51(this.block(node.body, prelude)).statements)]
+                }
                 // An object that says how to walk itself hands over its
                 // iterator, or its iteration, from `__iter`.
                 if (form.viaIter) source = luau.methodCall(source, "__iter", [])
