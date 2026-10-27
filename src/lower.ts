@@ -2921,8 +2921,11 @@ function usesVararg(node: unknown): boolean {
     return Object.values(record).some(usesVararg)
 }
 
-/** `tilua_array.filter` as an expression: a name, then a member per dot. */
+/** `tilua_array.filter` as an expression: a name, then a member per dot.
+ *  Anything else a library answers with — `tilua_schema["object"]` — is
+ *  parsed, so what it reads is seen as read (`SharedRuntime.shake`). */
 function calleePath(path: string): L.Expression {
+    if (!/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$/.test(path)) return parseExpressionFromSource(path)
     const [head, ...rest] = path.split(".")
     return rest.reduce<L.Expression>((value, name) => luau.member(value, name), luau.identifier(head))
 }

@@ -430,6 +430,17 @@ How a file is loaded depends on the Lua (see [Lua and Luau](#lua-and-luau)):
 Either way the files have to stay where they were written, relative to the
 entry's.
 
+<!-- compatibility:start -->
+## Compatibility
+
+`@tilua/compiler@7.0.1` works with these tilua packages. *Released with* is the
+version it was built and tested against.
+
+| Package | Range | Released with | |
+| --- | --- | --- | --- |
+| `@tilua/parser` | `^7.0.0` | 7.0.0 | dependency |
+<!-- compatibility:end -->
+
 ## Development
 
 ```bash

@@ -2216,6 +2216,34 @@ await lowers("^: a length or a negation on its left is bracketed",
     runs("tree shaking: unshaken, an import read by nothing loads nothing", whole, ["made", "made", "setup runs", "42\t9\t6,2,4\tagain", "lazy"])
 }
 
+// A library may call its runtime by index — `tilua_z["object"]`, as
+// `@tilua-types/zod` does — and what it calls that way is read, so it stays.
+{
+    const lowering = [
+        "const runtime = 'local __NAME__ = {}\\nfunction __NAME__.object(t) return \"object\" end\\nfunction __NAME__.unused() return 0 end'",
+        "export default {",
+        "    runtime: { z: runtime },",
+        "    globalCall({ name, use }) {",
+        "        return name.startsWith('z.') ? { callee: `${use('z')}[${JSON.stringify(name.slice(2))}]` } : undefined",
+        "    },",
+        "}",
+    ].join("\n")
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: ["z"], treeShaking: true }),
+        "node_modules/@tilua-types/z/package.json": JSON.stringify({ name: "@tilua-types/z", tilua: { types: "index.d.tilua", lowering: "lowering.mjs" } }),
+        "node_modules/@tilua-types/z/index.d.tilua": "declare function print(...args: unknown[]): nil\ndeclare z: { object: (t: unknown) => string, unused: () => number }\n",
+        "node_modules/@tilua-types/z/lowering.mjs": lowering,
+        "main.tilua": "print(z.object({}))\n",
+    })
+    const shaken = await bundle({ entry: join(root, "main.tilua") })
+    check("tree shaking: a runtime member called by index is kept", [
+        shaken.diagnostics.map(d => d.message),
+        (shaken.code ?? "").includes(".object("),
+        (shaken.code ?? "").includes(".unused("),
+    ], [[], true, false])
+    runs("tree shaking: a runtime member called by index runs", shaken, ["object"])
+}
+
 for (const failure of failures) console.log(`FAIL ${failure}`)
 const note = luauBinary ? "" : ` (${skipped} runs skipped: no Luau interpreter; set LUAU to run them)`
 console.log(`\n${passed} passed, ${failures.length} failed${note}`)
