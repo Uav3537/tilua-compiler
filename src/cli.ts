@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  *   tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>]
- *                 [--noCheck]
+ *                 [--noCheck] [--noLineMap]
  *
  * Bundles `entry` and every module it imports into one Lua file — by default
  * the entry's path with `.luau` — and reports problems as
@@ -12,6 +12,10 @@
  * reaches. `--output modules` writes one file per module, in the project's
  * own tree: `--out` is then the folder that tree goes in — by default the
  * project's, so each `.luau` lands beside its `.tilua`.
+ *
+ * `--noLineMap` leaves out the map that names an error's place in the
+ * project's files, as the config's `"lineMap": false` does: a smaller bundle
+ * for a release, whose errors name its own lines.
  */
 import { mkdirSync, writeFileSync } from "node:fs"
 import { basename, dirname, join, relative, resolve } from "node:path"
@@ -19,18 +23,20 @@ import { bundle } from "./bundle.js"
 import { resolveConfig } from "./config.js"
 import type { OutputMode } from "@tilua/parser"
 
-const usage = "usage: tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>] [--noCheck]"
+const usage = "usage: tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>] [--noCheck] [--noLineMap]"
 const args = process.argv.slice(2)
 let entry: string | undefined
 let out: string | undefined
 let config: string | undefined
 let typeCheck = true
+let lineMap: boolean | undefined
 let output: OutputMode | undefined
 for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === "--out") out = args[++i]
     else if (arg === "--config") config = args[++i]
     else if (arg === "--noCheck") typeCheck = false
+    else if (arg === "--noLineMap") lineMap = false
     else if (arg === "--target") {
         // The output is Lua that runs anywhere; a library says what more.
         console.error("--target is gone: the output runs on Lua 5.1 to 5.4, LuaJIT and Luau, "
@@ -66,7 +72,7 @@ async function main(from: string): Promise<never> {
     const folder = entryFile !== undefined ? dirname(entryFile) : out ?? found?.directory ?? dirname(from)
 
     const result = await bundle({
-        entry: from, config, typeCheck, output: mode,
+        entry: from, config, typeCheck, output: mode, lineMap,
         outFile: entryFile !== undefined ? basename(entryFile) : undefined,
     })
     for (const d of result.diagnostics) {

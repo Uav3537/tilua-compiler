@@ -71,7 +71,7 @@ import { parse as parseLuau, parseExpressionFromSource, print, type Statement as
 import { resolveConfig, type ConfigInput } from "./config.js"
 import { lower, syntaxOf, SharedRuntime, type ModuleInfo } from "./lower.js"
 import { treeShake } from "./treeshake.js"
-import { buildLineMap, lineMapSource, type Origin } from "./linemap.js"
+import { buildLineMap, lineMapSource, VLQ_DIGITS, type Origin } from "./linemap.js"
 import { loadLowerings } from "./lowering.js"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
@@ -93,6 +93,10 @@ export interface BundleOptions {
     /** Leave out what the entry never reaches. Overrides the config's
      *  `treeShaking`; off without either. */
     readonly treeShaking?: boolean
+    /** Write the map from the bundle's lines back to the project's. Overrides
+     *  the config's `lineMap`; on without either. Without it an error names
+     *  the bundle's lines, and the entry does not run under `xpcall`. */
+    readonly lineMap?: boolean
     /** What the entry's file is called: `main.luau`. The other files of
      *  `"chunks"` are named after it (`main_shop.luau`), and every file takes
      *  its extension. Default: the entry's own name, with `.luau`. */
@@ -211,6 +215,8 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const shared = new SharedRuntime(names)
     // What the entry never reaches is left out, when the project asks.
     const shaking = options.treeShaking ?? config?.treeShaking ?? false
+    // Errors named in the project's files, or left as Luau raised them.
+    const mapping = options.lineMap ?? config?.lineMap ?? true
     const resolveIn = (file: string) => (specifier: string): string | undefined => {
         const found = resolveModulePath(file, specifier, config)
         return found !== undefined && sources.has(found) ? found : undefined
@@ -251,8 +257,8 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
                 import: importExpression,
                 // One file has one line map. Several have one each, and a
                 // module reads the one of the file it is in.
-                lines: mode === "single" ? `${G}.lines` : `${G}.maps[${luauString(source.name)}]`,
-                fail: `${G}.fail`,
+                lines: !mapping ? undefined : mode === "single" ? `${G}.lines` : `${G}.maps[${luauString(source.name)}]`,
+                fail: mapping ? `${G}.fail` : undefined,
                 arrays: `${G}.arrays`,
                 resolve: (specifier, dynamic) => {
                     const found = resolveModulePath(file, specifier, config)
@@ -331,6 +337,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         byPath,
         files: elsewhere,
         imports: lowered.some(m => m.dynamicImports.size > 0),
+        mapping,
     }))
     const assignment = program.body.statements[1]
     // `scriptArgs` is what the bundle was started with — the chunk's own
@@ -353,28 +360,31 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     program.body.statements.unshift(...helpers.declare)
     // The entry runs under `xpcall`, so an error nothing caught — `nil.x`, an
     // `error` of the author's — is reported in the project's files rather than
-    // as a line of this bundle, and only then raised.
+    // as a line of this bundle, and only then raised. Without a map there is
+    // nothing to report it in, and it is left to rise as it is.
     const ok = names.fresh("ok")
     const result = names.fresh("result")
-    const entryStatements = parseLuau(`
+    const entryName = luauString(sources.get(entry)!.name)
+    const returnsExports = modules.get(entry)!.info.exports
+    const entryStatements = parseLuau(!mapping ? `${returnsExports ? "return " : ""}${G}.require(${entryName})` : `
 local ${ok}, ${result} = xpcall(function()
-    return ${G}.require(${luauString(sources.get(entry)!.name)})
+    return ${G}.require(${entryName})
 end, ${G}.fail)
 if not ${ok} then
     error(${result}, 0)
 end
-${modules.get(entry)!.info.exports ? `return ${result}` : ""}
+${returnsExports ? `return ${result}` : ""}
 `).body.statements
     program.body.statements.push(...entryStatements)
 
     // The map is read off the printed text, so it can only be built once that
     // text exists. Its own assignment then goes in immediately before the entry
     // runs — after every module body, so nothing the map describes moves.
-    const map = buildLineMap(program, parseLuau(print(program)), origins)
-    if (map.size || several) {
+    const map = mapping ? buildLineMap(program, parseLuau(print(program)), origins) : new Map<number, Origin>()
+    if (mapping && (map.size || several)) {
         const mapStatements: LuauStatement[] = [luau.assign(
             [luau.member(luau.identifier(G), "lines")],
-            [parseExpressionFromSource(lineMapSource(map))],
+            [parseExpressionFromSource(lineMapSource(map, `${G}.lineMap`))],
         )]
         if (several) mapStatements.push(...mapRegistration(G, layout[0], `${G}.lines`))
         program.body.statements.splice(program.body.statements.length - entryStatements.length, 0, ...mapStatements)
@@ -397,8 +407,11 @@ ${modules.get(entry)!.info.exports ? `return ${result}` : ""}
         }
         const chunk = luau.program([luau.returns([luau.functionExpression(luau.functionBody([G], body))])])
         // As in the entry's file: the map goes after everything it describes.
-        const lines = buildLineMap(chunk, parseLuau(print(chunk)), origins)
-        body.push(...mapRegistration(G, file, lineMapSource(lines)), ...fileHelpers.define)
+        if (mapping) {
+            const lines = buildLineMap(chunk, parseLuau(print(chunk)), origins)
+            body.push(...mapRegistration(G, file, lineMapSource(lines, `${G}.lineMap`)))
+        }
+        body.push(...fileHelpers.define)
         files.push({ path: file.path, code: print(chunk) + "\n", modules: file.modules.map(m => m.name) })
     }
 
@@ -542,6 +555,8 @@ interface RuntimeOptions {
     readonly files: ReadonlyMap<string, string>
     /** Some module writes `import()`. */
     readonly imports: boolean
+    /** The bundle carries a line map, and what reads it. */
+    readonly mapping: boolean
 }
 
 /** How the entry's file loads another of the output's files: `loadfile`,
@@ -572,15 +587,15 @@ function loader(G: string, byPath: boolean): string {
 
 /** The module table and its `require`, around the modules. */
 function runtime(G: string, options: RuntimeOptions): string {
-    const { several } = options
-    const files = [...options.files].map(([name, file]) => `[${luauString(name)}] = ${luauString(file)}`).join(", ")
+    const { several, mapping } = options
+    const files =[...options.files].map(([name, file]) => `[${luauString(name)}] = ${luauString(file)}`).join(", ")
     return `
 local ${G}
 ${G} = {
     modules = {},
     -- Every array the program made, so \`typeof\` can tell one from an object.
     -- The keys are held weakly: being written down keeps no array alive.
-    arrays = setmetatable({}, { __mode = "k" }),
+    arrays = setmetatable({}, { __mode = "k" }),${mapping ? `
     -- Filled in just before the entry runs: bundle line -> { file, line }.
     lines = nil,
     -- What an error nothing caught says, in the project's files: the bundle's
@@ -748,13 +763,49 @@ ${several ? `
         end
         return mapped .. "\\n" .. table.concat(frames, "\\n")
     end,
+    -- A line map as it is written: the files it names, and base-64 VLQ
+    -- numbers, three to a line — how far down the bundle, which file, how far
+    -- down that file, each counted from the line before. It is read out the
+    -- first time a line is looked up, which is when something went wrong.
+    lineMap = function(files, data)
+        local map = {}
+        return setmetatable(map, { __index = function(_, key)
+            setmetatable(map, nil)
+            local digits = {}
+            for i = 1, 64 do
+                digits[("${VLQ_DIGITS}"):byte(i)] = i - 1
+            end
+            local at = 1
+            local function read()
+                local value, scale = 0, 1
+                repeat
+                    local digit = digits[data:byte(at)]
+                    at = at + 1
+                    value = value + digit % 32 * scale
+                    scale = scale * 32
+                until digit < 32
+                if value % 2 == 1 then
+                    return -math.floor(value / 2)
+                end
+                return math.floor(value / 2)
+            end
+            local line, file, source = 0, 0, 0
+            while at <= #data do
+                line = line + read()
+                file = file + read()
+                source = source + read()
+                map[line] = { files[file], source }
+            end
+            return map[key]
+        end })
+    end,` : ""}
     records = {},${several ? `
     -- The file each module outside this one is in, as \`load\` is handed it.
     files = { ${files} },
-    loaded = {},
+    loaded = {},${mapping ? `
     -- Every file's line map: by the module, and by the file's name.
     maps = {},
-    sources = {},
+    sources = {},` : ""}
     -- Another of the bundle's files: a function that adds its modules here.
     load = function(file)
         if ${G}.loaded[file] then

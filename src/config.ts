@@ -23,6 +23,9 @@ export interface TiluaConfigJson {
     noLib?: boolean
     /** Leave out of the bundle what the entry never reaches (`treeShake`). */
     treeShaking?: boolean
+    /** Write the map from the bundle's lines back to the project's, which
+     *  error reports and `console` read. Default: true. */
+    lineMap?: boolean
 }
 
 /** A config file's path, or the config itself. Relative paths — to a config

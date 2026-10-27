@@ -23,6 +23,7 @@ import { bundle, compile, type BundleResult } from "../src/index.js"
 import { lower } from "../src/lower.js"
 import type { LoadedLowering, LoweringPlugin, LuaSyntax } from "../src/lowering.js"
 import * as luau from "../src/luau.js"
+import { VLQ_DIGITS } from "../src/linemap.js"
 
 let passed = 0
 let skipped = 0
@@ -656,6 +657,99 @@ runs("try: catch, finally, jumps out of it and nesting run as in JavaScript", aw
             said.includes("error in error handling"),
         ], [true, true, false])
     }
+
+    // `"lineMap": false`: no map, nothing that reads one, and the entry not
+    // under `xpcall` — the error rises as Luau raised it, at the bundle's line.
+    const bare = await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false, lineMap: false })
+    writeFileSync(join(root, "tilua.config.json"), JSON.stringify({ types: [], lineMap: false }))
+    const configured = await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false })
+    check("lineMap: false leaves out the map and what reads it", [
+        /\.lines\b|lineMap|describe|xpcall/.test(bare.code ?? "x.lines"),
+        configured.code === bare.code,
+        (bare.code ?? "").length < (result.code ?? "").length,
+    ], [false, true, true])
+    if (luauBinary && bare.code !== undefined) {
+        const file = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
+        writeFileSync(file, bare.code)
+        let stderr = ""
+        try {
+            execFileSync(luauBinary, [file], { encoding: "utf8", stdio: "pipe" })
+        } catch (error) {
+            stderr = (error as { stderr?: string }).stderr ?? ""
+        }
+        check("lineMap: false: an uncaught error names the bundle's line",
+            /bundle\.luau:\d+: attempt to index nil with 'value'/.test(stderr.split(/\r?\n/)[0]), true)
+    }
+}
+
+// The map is written packed, and read back the first time a line is looked
+// up: every line of a big bundle, across files, and lines that go back up a
+// file (a hoisted function), each read back where it was written.
+{
+    const { lineMapSource } = await import("../src/linemap.js")
+    const origins = new Map<number, { file: string; line: number }>()
+    for (let line = 1; line <= 3000; line += 1 + (line % 3)) {
+        origins.set(line, { file: line % 7 ? "src/a.tilua" : "src\\b.tilua", line: (line * 37) % 5003 })
+    }
+    const source = lineMapSource(origins, "G.lineMap")
+    check("line map: packed, it is a small part of what it was",
+        source.length * 5 < [...origins].map(([n, o]) => `[${n}]={"${o.file}",${o.line}}`).join(",").length, true)
+    if (luauBinary) {
+        const result = await bundle({
+            entry: join(project({ "src/main.tilua": "print(1)\n", "tilua.config.json": "{}" }), "src/main.tilua"),
+            typeCheck: false,
+        })
+        // The bundle's own table, which the lines after it can still see.
+        const G = /^(\w+) = \{\s*modules = /m.exec(result.code ?? "")?.[1] ?? "G"
+        const probe = [...origins.keys()].filter((_, i) => i % 97 === 0).concat([2, 4000])
+        const file = join(mkdtempSync(join(tmpdir(), "tilua-run-")), "bundle.luau")
+        writeFileSync(file, [
+            result.code ?? "",
+            `local lines = ${source.replace("G.lineMap", `${G}.lineMap`)}`,
+            ...probe.map(n => `do local o = lines[${n}]; print(${n}, o and o[1] or "-", o and o[2] or "-") end`),
+        ].join("\n"))
+        let said = ""
+        try {
+            said = execFileSync(luauBinary, [file], { encoding: "utf8", stdio: "pipe" })
+        } catch (error) {
+            said = `${(error as { stderr?: string }).stderr ?? ""}`
+        }
+        check("line map: Luau reads back every line where it was written",
+            // After the bundle's own `print(1)`.
+            said.trim().split(/\r?\n/).slice(1).map(l => l.split(/\t/).join(" ")),
+            probe.map(n => {
+                const o = origins.get(n)
+                return o ? `${n} ${o.file.replace(/\\/g, "/")} ${o.line}` : `${n} - -`
+            }))
+    }
+}
+
+/** The line map a bundle carries, read as the bundle's `lineMap` reads it:
+ *  bundle line -> `file:line`. */
+function readLineMap(code: string): Map<number, string> {
+    const map = new Map<number, string>()
+    const call = /\.lines = \w+\.lineMap\(\{([^}]*)\},\s*"([^"]*)"\)/.exec(code)
+    if (!call) return map
+    const files = [...call[1].matchAll(/"([^"]*)"/g)].map(m => m[1])
+    const data = call[2]
+    let at = 0
+    const read = (): number => {
+        let value = 0, scale = 1, digit: number
+        do {
+            digit = VLQ_DIGITS.indexOf(data[at++])
+            value += (digit % 32) * scale
+            scale *= 32
+        } while (digit >= 32)
+        return value % 2 ? -Math.floor(value / 2) : Math.floor(value / 2)
+    }
+    let line = 0, file = 0, source = 0
+    while (at < data.length) {
+        line += read()
+        file += read()
+        source += read()
+        map.set(line, `${files[file - 1]}:${source}`)
+    }
+    return map
 }
 
 // A bundle is one file, so a line in it says nothing about which of the
@@ -679,10 +773,7 @@ runs("try: catch, finally, jumps out of it and nesting run as in JavaScript", aw
     const result = await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false })
     const code = result.code ?? ""
     const lines = code.split("\n")
-    const map = new Map<number, string>()
-    for (const m of code.slice(code.indexOf(".lines = ")).matchAll(/\[(\d+)\]\s*=\s*\{\s*"([^"]+)"\s*,\s*(\d+)\s*\}/g)) {
-        map.set(Number(m[1]), `${m[2]}:${m[3]}`)
-    }
+    const map = readLineMap(code)
     // Every mapped line, as `what the bundle says` -> `where it was written`.
     const resolved = [...map].sort((a, b) => a[0] - b[0])
         .map(([line, origin]) => `${(lines[line - 1] ?? "").trim()} -> ${origin}`)

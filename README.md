@@ -14,7 +14,7 @@ npx tilua src/main.tilua --out build/main.luau
 
 ```
 tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>]
-              [--noCheck]
+              [--noCheck] [--noLineMap]
 ```
 
 Every module the entry imports is bundled in. Problems are reported as
@@ -296,6 +296,16 @@ With several files each has its own line map, and a position is read by the
 map of the file it names — matched by the end of that file's path, since the
 Lua running it may call it by a full path, a relative one, or an Instance's.
 
+The map is packed — the files it names once, then three base-64 VLQ numbers a
+line, each counted from the line before — and read out the first time a line
+is looked up, so a program that never fails never unpacks it.
+
+For a release nobody will debug, `"lineMap": false` in `tilua.config.json`
+(or `--noLineMap`, or `bundle({ lineMap: false })`) leaves out the map and
+everything that reads it: the entry runs without `xpcall`, a callback handed
+to Roblox is passed through unwrapped, and an error names the bundle's own
+lines, as plain Luau would.
+
 ## Modules
 
 Roblox's `require` takes an Instance, so the bundle has its own. Each module
@@ -434,12 +444,12 @@ entry's.
 <!-- compatibility:start -->
 ## Compatibility
 
-`@tilua/compiler@8.0.0` works with these tilua packages. *Released with* is the
+`@tilua/compiler@8.1.0` works with these tilua packages. *Released with* is the
 version it was built and tested against.
 
 | Package | Range | Released with | |
 | --- | --- | --- | --- |
-| `@tilua/parser` | `^8.0.0` | 8.0.0 | dependency |
+| `@tilua/parser` | `^8.1.0` | 8.1.0 | dependency |
 <!-- compatibility:end -->
 
 ## Development

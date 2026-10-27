@@ -81,12 +81,45 @@ export function buildLineMap(
     return map
 }
 
-/** The map as Luau source: `{ [12] = { "src/a.tilua", 3 }, ... }`.
+/** The digits of the map's numbers, as source maps write them. */
+export const VLQ_DIGITS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+/** `n` as base-64 VLQ: five bits to a digit, lowest first, the sixth bit set
+ *  on every digit but the last, and the sign in the lowest bit. */
+function vlq(n: number): string {
+    let value = n < 0 ? -n * 2 + 1 : n * 2
+    let out = ""
+    do {
+        const digit = value % 32
+        value = Math.floor(value / 32)
+        out += VLQ_DIGITS[value > 0 ? digit + 32 : digit]
+    } while (value > 0)
+    return out
+}
+
+/** The map as Luau source: `unpack({ "src/a.tilua", ... }, "QAGC...")`, which
+ *  the bundle's `lineMap` turns back into `{ [12] = { "src/a.tilua", 3 } }`.
+ *
+ *  Written out in full, a file's name on every line, the map was often the
+ *  larger part of a bundle. Each line is three numbers here instead, counted
+ *  from the line before: mostly one digit each.
  *
  *  Written as text rather than built as a tree because it is data, it is large,
  *  and it is the one thing in the output whose own line numbers do not matter. */
-export function lineMapSource(map: ReadonlyMap<number, Origin>): string {
+export function lineMapSource(map: ReadonlyMap<number, Origin>, unpack: string): string {
     const entries = [...map.entries()].sort((a, b) => a[0] - b[0])
-    const quoted = (s: string): string => luauString(s.replace(/\\/g, "/"))
-    return `{${entries.map(([line, o]) => `[${line}]={${quoted(o.file)},${o.line}}`).join(",")}}`
+    const files: string[] = []
+    const indexes = new Map<string, number>()
+    let data = ""
+    let line = 0, file = 0, source = 0
+    for (const [at, origin] of entries) {
+        const name = origin.file.replace(/\\/g, "/")
+        if (!indexes.has(name)) indexes.set(name, files.push(name))
+        const index = indexes.get(name)!
+        data += vlq(at - line) + vlq(index - file) + vlq(origin.line - source)
+        line = at
+        file = index
+        source = origin.line
+    }
+    return `${unpack}({${files.map(luauString).join(",")}},${luauString(data)})`
 }
