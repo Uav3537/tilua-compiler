@@ -85,6 +85,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs"
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries, importExpressions,
+    sourceMapOf, sourceMapTypes, outputPathOf, type SourceMapTypes,
     directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, UNUSED_EXPECT_WARNING, ParseError, LexError, luauString,
     type ModuleExports, type Program, type ScopeAnalysis, type TiluaConfig, type TypeAnalysis, type Directives,
     type OutputMode, type TypeLibraries,
@@ -1311,6 +1312,48 @@ function importedSpecifiers(program: Program): string[] {
  *  size and modification time say when it has to be read anew. */
 const libraryCache = new Map<string, { stamp: string; program: Program }>()
 
+/** The instance tree's types, kept while its text and the libraries are the
+ *  same: a rebuild reuses them, and so the analyses that read them. */
+let treeCache: { text: string; libs: readonly Program[]; types: SourceMapTypes; scripts: Map<string, Program | undefined> } | undefined
+
+/** The instance tree a config's project has (`sourceMapOf`), as types — read
+ *  where there are instances to type, as the editor reads it. A tree found by
+ *  itself that cannot be read is no one's problem; one the config names is. */
+function instanceTree(
+    config: TiluaConfig,
+    libs: readonly Program[],
+    noLib: boolean,
+): { types?: SourceMapTypes; problem?: { file: string; message: string } } | undefined {
+    const tree = sourceMapOf(config)
+    if (!tree) return undefined
+    if ("problem" in tree) return tree.named ? { problem: { file: config.path, message: tree.problem } } : undefined
+    const declares = (name: string): boolean => libs.some(lib => lib.body.statements.some(s => s.type === "DeclareStatement" && s.name === name))
+    if (!tree.named && !declares("game")) return undefined
+    if (treeCache && treeCache.text === tree.text && treeCache.libs.length === libs.length && treeCache.libs.every((lib, i) => lib === libs[i])) {
+        return { types: treeCache.types }
+    }
+    const empty = parse("")
+    const aliases = analyzeTypes(empty, analyzeScopes(empty, { noLib }), { libs, noLib, diagnostics: false }).aliases
+    // A child a member already names is left out, as Roblox resolves the member.
+    const membersOf = (className: string): ReadonlySet<string> => {
+        const type = aliases.get(className)
+        return new Set(type?.kind === "object" ? type.properties.keys() : ["Name", "ClassName", "Parent", "Archivable"])
+    }
+    const { types, problem } = sourceMapTypes(tree.text, tree.path, { classes: new Set(aliases.keys()), membersOf })
+    if (!types) return tree.named && problem ? { problem: { file: tree.path, message: problem } } : undefined
+    // A file's `script` is parsed once, so analyses that read it can be kept.
+    const scripts = new Map<string, Program | undefined>()
+    const cached: SourceMapTypes = {
+        program: types.program,
+        scriptFor: file => {
+            if (!scripts.has(file)) scripts.set(file, types.scriptFor(file))
+            return scripts.get(file)
+        },
+    }
+    treeCache = { text: tree.text, libs: [...libs], types: cached, scripts }
+    return { types: cached }
+}
+
 function parsedLibrary(file: string): Program {
     let stamp: string
     try {
@@ -1363,6 +1406,12 @@ function analyzeModules(
     const libs = libraries.files.map(parsedLibrary)
     const noLib = config?.noLib ?? false
     const checked = libs.length > 0 || !noLib
+    // The instance tree, as the editor has it: `game.Workspace.Baseplate`,
+    // and each file's own `script`.
+    const tree = config ? instanceTree(config, libs, noLib) : undefined
+    if (tree?.problem) out.push({ file: tree.problem.file, message: tree.problem.message, line: 1, column: 1, category: "config" })
+    if (tree?.types) libs.push(tree.types.program)
+    const scriptOf = (file: string): Program | undefined => tree?.types && config ? tree.types.scriptFor(outputPathOf(config, file)) : undefined
     const globals = libs.flatMap(lib => lib.body.statements.flatMap(s => (s.type === "DeclareStatement" ? [s.name] : [])))
 
     const byFile = new Map(modules.map(m => [m.file, m]))
@@ -1385,8 +1434,11 @@ function analyzeModules(
         const done = analyzed.get(file)
         if (done) return done
         const remembered = moduleAnalyses.get(file)
-        if (remembered && remembered.setting === settingFor && libs.length === remembered.libs.length
-            && remembered.libs.every((lib, i) => lib === libs[i])
+        // The file's own `script`, where the tree has it.
+        const script = scriptOf(file)
+        const ownLibs = script ? [...libs, script] : libs
+        if (remembered && remembered.setting === settingFor && ownLibs.length === remembered.libs.length
+            && remembered.libs.every((lib, i) => lib === ownLibs[i])
             && remembered.program === program
             && [...remembered.read].every(([read, stamp]) => stampOf(read) === stamp)) {
             analyzed.set(file, remembered.result)
@@ -1406,7 +1458,7 @@ function analyzeModules(
         }
         const before = partials
         const types = analyzeTypes(program, scopes, {
-            libs,
+            libs: ownLibs,
             resolveModule: resolverFor(file),
             noLib,
             reportUnknownTypes: checked,
@@ -1425,7 +1477,7 @@ function analyzeModules(
             // Only a module whose every file was readable is worth keeping:
             // one that was not may become readable, and change the answer.
             if ([...read.values()].every(stamp => stamp !== undefined)) {
-                moduleAnalyses.set(file, { setting: settingFor, libs: [...libs], program, read, result })
+                moduleAnalyses.set(file, { setting: settingFor, libs: [...ownLibs], program, read, result })
             }
         }
         return result

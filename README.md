@@ -18,9 +18,11 @@ tilua [<entry>] [--out <file>] [--output single|chunks|files] [--config <tilua.c
 tilua init
 ```
 
-`--watch` builds again whenever a `.tilua` file, the config or a Rojo project
-changes, and keeps going. `tilua init` writes a `tilua.config.json` for the
-Rojo project in the folder — see `@tilua-types/roblox`.
+`--watch` builds again whenever a file it reads changes — a `.tilua`, the
+config, a Rojo project, and with an `outDir` of its own anything under
+`rootDir` — and keeps going. `tilua init` sets up the Rojo project in the
+folder: `src` compiled to `out`, and the project pointed at `out` — see
+`@tilua-types/roblox`.
 
 Every module the entry imports is bundled in. Problems are reported as
 `file:line:column message`. Type errors are checked against the config's
@@ -486,7 +488,12 @@ tilua            # the config above this folder says the rest
 `rootDir` is the config's folder unless set, and `outDir` is `rootDir`, so
 each `.luau` lands beside its `.tilua`. Every file it writes ends with a line
 saying tilua wrote it: the CLI never replaces a `.luau` without that line —
-one written by hand — and removes one with it whose `.tilua` is gone. `--out` names the folder in place of
+one written by hand — and removes one with it whose `.tilua` is gone.
+
+With an `outDir` of its own, the CLI makes it a mirror of `rootDir`: every
+`.tilua` compiled, every other file copied as it is, every folder there, and
+nothing else. `outDir` is the build's alone, so it may not hold `rootDir` or
+the project, nor sit under `rootDir`. `--out` names the folder in place of
 `outDir`. From the API, `bundle({ output: "files", root })` without an
 `entry`; `result.files` holds every file, its path from `outDir`.
 
@@ -539,12 +546,12 @@ a script that requires any of them knows what it got.
 <!-- compatibility:start -->
 ## Compatibility
 
-`@tilua/compiler@9.0.0` works with these tilua packages. *Released with* is the
+`@tilua/compiler@9.0.1` works with these tilua packages. *Released with* is the
 version it was built and tested against.
 
 | Package | Range | Released with | |
 | --- | --- | --- | --- |
-| `@tilua/parser` | `^9.0.0` | 9.0.0 | dependency |
+| `@tilua/parser` | `^9.0.1` | 9.0.1 | dependency |
 <!-- compatibility:end -->
 
 ## Development

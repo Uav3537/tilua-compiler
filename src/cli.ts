@@ -17,17 +17,23 @@
  * `outDir`, in the same place — `src/shop.tilua` to `dist/shop.luau` — each
  * of which returns its exports. `--out` is then the folder, in place of
  * `outDir`. Without an entry the config is the nearest one above the folder
- * the command runs in, unless `--config` names one. Every file it writes ends
- * with a line saying so: a `.luau` without that line was written by hand, and
- * is never replaced; one with it whose `.tilua` is gone is removed.
+ * the command runs in, unless `--config` names one.
  *
- * `--watch` builds again whenever a `.tilua` file, the config or a Rojo
- * project changes, and keeps going — beside `rojo serve`, which syncs what it
- * writes into Studio.
+ * With an `outDir` of its own, the output is a mirror of `rootDir`: each
+ * `.tilua` compiled, every other file — a `.luau` written by hand, a
+ * `.meta.json`, a model — copied as it is, and anything else in `outDir`
+ * removed. `outDir` is the build's alone. With `outDir` left as `rootDir`
+ * each `.luau` lands beside its `.tilua`, and ends with a line saying tilua
+ * wrote it: one without that line was written by hand and is never replaced,
+ * and one with it whose `.tilua` is gone is removed.
  *
- * `tilua init` writes a `tilua.config.json` for the Rojo project in this
- * folder: Roblox's types, and a `.luau` beside each `.tilua` under the folder
- * its `$path`s share, where the project already reads them.
+ * `--watch` builds again whenever a file under `rootDir`, the config or a
+ * Rojo project changes, and keeps going — beside `rojo serve`, which syncs
+ * what it writes into Studio.
+ *
+ * `tilua init` sets up the Rojo project in this folder: a `tilua.config.json`
+ * with Roblox's types that compiles the folder its `$path`s share (`src`) to
+ * `out`; the project's `$path`s pointed at `out`; and `/out` in `.gitignore`.
  *
  * `--noLineMap` leaves out the map that names an error's place in the
  * project's files, as the config's `"lineMap": false` does: a smaller bundle
@@ -36,11 +42,11 @@
  * `--minify` writes it on one line, as the config's `"minify": true` does:
  * smaller still, and without the line map, which one line cannot have.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs"
-import { basename, dirname, join, relative, resolve, sep } from "node:path"
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, watch, writeFileSync } from "node:fs"
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { bundle, WRITTEN_BY_TILUA, type BundleResult } from "./bundle.js"
 import { resolveConfig } from "./config.js"
-import type { OutputMode } from "@tilua/parser"
+import { stripJsonComments, type OutputMode } from "@tilua/parser"
 
 const usage = "usage: tilua [<entry>] [--out <file>] [--output single|chunks|files] [--config <tilua.config.json>] "
     + "[--noCheck] [--noLineMap] [--minify] [--watch]\n       tilua init"
@@ -87,51 +93,113 @@ for (let i = 0; i < args.length; i++) {
 
 const shown = (path: string): string => relative(process.cwd(), path) || "."
 
-/** `tilua init`: a config for the Rojo project in this folder. */
+/** The folder the build writes to with `tilua init`. */
+const OUT = "out"
+
+/** `tilua init`: the Rojo project in this folder, set up to be built. A
+ *  config that already compiles each `.tilua` beside itself is moved over to
+ *  `out`, keeping the rest of what it says. */
 function init(): never {
     const folder = process.cwd()
+    let existing: { path: string; options: Record<string, unknown> } | undefined
     for (const name of ["tilua.config.json", "tilua.config.jsonc"]) {
-        if (existsSync(join(folder, name))) {
+        const path = join(folder, name)
+        if (!existsSync(path)) continue
+        let options: Record<string, unknown> = {}
+        try {
+            options = JSON.parse(stripJsonComments(readFileSync(path, "utf8"))) as Record<string, unknown>
+        } catch (error) {
+            console.error(`${name}: ${(error as Error).message}`)
+            process.exit(1)
+        }
+        if (options.output !== "files" || (options.outDir !== undefined && options.outDir !== options.rootDir)) {
             console.error(`${name} is already here`)
             process.exit(1)
         }
+        existing = { path, options }
     }
-    // What the project reads files from: the folder its `$path`s share.
-    let rootDir = "src"
     const project = join(folder, "default.project.json")
-    if (existsSync(project)) {
-        const paths: string[] = []
-        const walk = (node: unknown): void => {
-            if (!node || typeof node !== "object") return
-            const path = (node as { $path?: unknown }).$path
-            const named = typeof path === "string" ? path : (path as { optional?: unknown } | undefined)?.optional
-            if (typeof named === "string" && !/\.\w+$/.test(named)) paths.push(named)
-            for (const [key, child] of Object.entries(node)) if (!key.startsWith("$")) walk(child)
-        }
-        try {
-            walk((JSON.parse(readFileSync(project, "utf8")) as { tree?: unknown }).tree)
-        } catch (error) {
-            console.error(`default.project.json: ${(error as Error).message}`)
-            process.exit(1)
-        }
-        const split = paths.map(path => path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "").split("/"))
-        const shared: string[] = []
-        for (let i = 0; split.length && split.every(parts => parts.length > i && parts[i] === split[0][i]); i++) shared.push(split[0][i])
-        // A project that maps one folder reads that folder's files.
-        if (split.length) rootDir = shared.join("/") || "."
-    } else {
-        console.error("No default.project.json here: rootDir is \"src\". Change it if the project reads its files from elsewhere.")
+    if (!existsSync(project)) {
+        console.error("No default.project.json here: run `tilua init` in the folder of a Rojo project (`rojo init` makes one)")
+        process.exit(1)
     }
-    const written = { types: ["roblox"], output: "files", rootDir }
-    writeFileSync(join(folder, "tilua.config.json"), JSON.stringify(written, null, 4) + "\n")
-    console.log("tilua.config.json: a .luau beside each .tilua under " + rootDir)
+    const text = readFileSync(project, "utf8")
+    // What the project reads files from: the folder its `$path`s share.
+    const paths: string[] = []
+    const walk = (node: unknown): void => {
+        if (!node || typeof node !== "object") return
+        const path = (node as { $path?: unknown }).$path
+        const named = typeof path === "string" ? path : (path as { optional?: unknown } | undefined)?.optional
+        if (typeof named === "string") paths.push(named)
+        for (const [key, child] of Object.entries(node)) if (!key.startsWith("$")) walk(child)
+    }
+    try {
+        walk((JSON.parse(text) as { tree?: unknown }).tree)
+    } catch (error) {
+        console.error(`default.project.json: ${(error as Error).message}`)
+        process.exit(1)
+    }
+    const split = paths.map(path => path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "").split("/"))
+    const shared: string[] = []
+    for (let i = 0; split.length && split.every(parts => parts.length > i && parts[i] === split[0][i]); i++) shared.push(split[0][i])
+    // A single `$path` that is a file is no folder to compile.
+    if (split.length === 1 && /\.\w+$/.test(shared.at(-1) ?? "")) shared.pop()
+    const rootDir = shared.join("/")
+    if (!rootDir) {
+        console.error("The project's $paths share no folder to compile from: put the code under one (src), as `rojo init` does")
+        process.exit(1)
+    }
+    if (rootDir === OUT || rootDir.startsWith(`${OUT}/`)) {
+        console.error(`The project already reads from ${OUT}: set tilua.config.json up by hand`)
+        process.exit(1)
+    }
+    const out = join(folder, OUT)
+    if (existsSync(out) && readdirSync(out).length) {
+        console.error(`${OUT} is already here and not empty: the build would replace what is in it`)
+        process.exit(1)
+    }
+
+    const options = existing
+        ? { ...existing.options, rootDir: existing.options.rootDir ?? rootDir, outDir: OUT }
+        : { types: ["roblox"], output: "files", rootDir, outDir: OUT }
+    writeFileSync(existing?.path ?? join(folder, "tilua.config.json"), JSON.stringify(options, null, 4) + "\n")
+    console.log(`${basename(existing?.path ?? "tilua.config.json")}: ${String(options.rootDir)} compiled to ${OUT}`)
+    // Each `$path` under `rootDir` points at the same place under `out`. The
+    // text is changed where the paths are written, and nowhere else.
+    const escaped = rootDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    let changed = 0
+    const pointed = text.replace(new RegExp(`("\\$path"\\s*:\\s*")(\\./)?${escaped}(?=/|")`, "g"), (_, head: string) => {
+        changed++
+        return `${head}${OUT}`
+    })
+    writeFileSync(project, pointed)
+    console.log(`default.project.json: ${changed} $path${changed === 1 ? "" : "s"} now read from ${OUT}`)
+    const ignore = join(folder, ".gitignore")
+    const ignored = existsSync(ignore) ? readFileSync(ignore, "utf8") : ""
+    if (!ignored.split(/\r?\n/).some(line => [OUT, `/${OUT}`, `${OUT}/`, `/${OUT}/`].includes(line.trim()))) {
+        writeFileSync(ignore, `${ignored}${ignored && !ignored.endsWith("\n") ? "\n" : ""}\n# What tilua builds from ${rootDir}\n/${OUT}\n`)
+        console.log(`.gitignore: /${OUT}`)
+    }
     console.log("Next: npm i -D @tilua/compiler @tilua-types/roblox, then run `npx tilua --watch` beside `rojo serve`.")
     process.exit(0)
 }
 
-/** Every `.luau` under `folder` tilua wrote, by its last line. */
-function writtenByTilua(folder: string): string[] {
-    const found: string[] = []
+/** Is `path` `folder`, or under it? */
+function isInside(folder: string, path: string): boolean {
+    const below = relative(folder, path)
+    return below === "" || (!below.startsWith("..") && !isAbsolute(below))
+}
+
+/** Every file under `folder`, but under `node_modules` or `.git`. */
+function filesUnder(folder: string): string[] {
+    return under(folder).files
+}
+
+/** Every file and every folder under `folder` — hidden ones too, since the
+ *  output mirrors all of it — but under `node_modules` or `.git`. */
+function under(folder: string): { files: string[]; folders: string[] } {
+    const files: string[] = []
+    const folders: string[] = []
     const walk = (at: string): void => {
         let items
         try {
@@ -140,14 +208,32 @@ function writtenByTilua(folder: string): string[] {
             return
         }
         for (const item of items) {
-            if (item.name.startsWith(".") || item.name === "node_modules") continue
+            if (item.name === "node_modules" || item.name === ".git") continue
             const path = join(at, item.name)
-            if (item.isDirectory()) walk(path)
-            else if (/\.luau?$/.test(item.name) && isTilua(path)) found.push(path)
+            if (item.isDirectory()) {
+                folders.push(path)
+                walk(path)
+            } else files.push(path)
         }
     }
     walk(folder)
-    return found
+    return { files, folders }
+}
+
+/** Remove the folders under `folder` that hold nothing, but the ones in
+ *  `keep`. */
+function removeEmpty(folder: string, keep: ReadonlySet<string>): void {
+    for (const item of readdirSync(folder, { withFileTypes: true })) {
+        if (!item.isDirectory()) continue
+        const path = join(folder, item.name)
+        removeEmpty(path, keep)
+        if (!readdirSync(path).length && !keep.has(resolve(path))) rmdirSync(path)
+    }
+}
+
+/** Every `.luau` under `folder` tilua wrote, by its last line. */
+function writtenByTilua(folder: string): string[] {
+    return filesUnder(folder).filter(path => /\.luau?$/.test(path) && isTilua(path))
 }
 
 /** Did tilua write the file at `path`? */
@@ -174,6 +260,15 @@ async function build(from: string | undefined): Promise<boolean> {
     const perFile = mode === "files"
     const entryFile = perFile || from === undefined ? undefined : out ?? from.replace(/\.tilua$/, "") + ".luau"
     const folder = resolve(entryFile !== undefined ? dirname(entryFile) : out ?? found?.outDir ?? process.cwd())
+    // With a folder of its own the output mirrors `rootDir`, and the folder
+    // is the build's: what it does not write there goes. So it may hold
+    // nothing else — not the sources, and not the project.
+    const rootDir = resolve(found?.rootDir ?? process.cwd())
+    const mirror = perFile && resolve(folder) !== rootDir
+    if (mirror && (isInside(folder, rootDir) || isInside(rootDir, folder) || isInside(folder, found?.directory ?? process.cwd()))) {
+        console.error(`outDir (${shown(folder)}) has to be a folder of its own: not ${isInside(rootDir, folder) ? "under" : "around"} rootDir (${shown(rootDir)}), and not around the project`)
+        return false
+    }
 
     const result: BundleResult = await bundle({
         entry: perFile ? undefined : from, config, typeCheck, output: mode, lineMap, minify,
@@ -189,6 +284,62 @@ async function build(from: string | undefined): Promise<boolean> {
     }
 
     const targets = result.files.map(file => ({ ...file, target: join(folder, file.path) }))
+    if (mirror) {
+        // Every file under `rootDir` that is not tilua's own goes across as it
+        // is, whatever it is — a `.luau` written by hand, a `.meta.json`, a
+        // model, an asset. `.tilua` is compiled, and `.d.tilua` only checked.
+        const compiled = new Map(targets.map(file => [resolve(file.target), file]))
+        const copies: { source: string; target: string }[] = []
+        let clash = false
+        const leftovers: string[] = []
+        for (const source of filesUnder(rootDir)) {
+            if (source.endsWith(".tilua")) continue
+            // What tilua compiled beside a `.tilua` before the output had a
+            // folder of its own: the build's to remove, not to copy.
+            if (/\.luau?$/.test(source) && isTilua(source)) {
+                leftovers.push(source)
+                continue
+            }
+            const target = resolve(folder, relative(rootDir, source))
+            if (compiled.has(target)) {
+                console.error(`${shown(source)}: a .tilua compiles to the same file — rename or remove one of them`)
+                clash = true
+                continue
+            }
+            copies.push({ source, target })
+        }
+        if (clash) return false
+        for (const leftover of leftovers) {
+            rmSync(leftover)
+            console.log(`${shown(leftover)}: removed — tilua compiled it beside its .tilua, and the output is in ${shown(folder)} now`)
+        }
+        for (const file of targets) {
+            if (existsSync(file.target) && readFileSync(file.target, "utf8") === file.code) continue
+            mkdirSync(dirname(file.target), { recursive: true })
+            writeFileSync(file.target, file.code)
+            console.log(`${shown(file.target)}: ${file.modules.length} module${file.modules.length === 1 ? "" : "s"}`)
+        }
+        for (const { source, target } of copies) {
+            const bytes = readFileSync(source)
+            if (existsSync(target) && readFileSync(target).equals(bytes)) continue
+            mkdirSync(dirname(target), { recursive: true })
+            copyFileSync(source, target)
+            console.log(`${shown(target)}: copied`)
+        }
+        // What the build did not write is not the build's any more.
+        const kept = new Set([...compiled.keys(), ...copies.map(copy => copy.target)])
+        for (const stale of filesUnder(folder)) {
+            if (kept.has(resolve(stale))) continue
+            rmSync(stale)
+            console.log(`${shown(stale)}: removed`)
+        }
+        // Every folder `rootDir` has is there, empty or not: a Rojo project
+        // names folders, and one that is missing stops it.
+        const folders = new Set([folder, ...under(rootDir).folders.map(path => resolve(folder, relative(rootDir, path)))])
+        for (const path of folders) mkdirSync(path, { recursive: true })
+        removeEmpty(folder, folders)
+        return !result.diagnostics.some(d => d.severity !== "warning")
+    }
     if (perFile) {
         // A `.luau` someone wrote is theirs: one a `.tilua` would replace stops
         // the build before anything is written.
@@ -218,11 +369,15 @@ async function build(from: string | undefined): Promise<boolean> {
     return !result.diagnostics.some(d => d.severity !== "warning")
 }
 
-/** Build, then build again whenever a `.tilua`, the config or a Rojo project
- *  changes under the project's folder. */
+/** Build, then build again whenever what it reads changes under the
+ *  project's folder: a `.tilua`, the config, a Rojo project — and, where the
+ *  output mirrors `rootDir`, any file there. */
 async function watchAndBuild(from: string | undefined): Promise<void> {
     const found = resolveConfig(config, resolve(from ?? "tilua.config.json")).config
     const folder = found?.directory ?? (from !== undefined ? dirname(resolve(from)) : process.cwd())
+    const rootDir = found?.rootDir
+    const outDir = resolve(out ?? found?.outDir ?? folder)
+    const mirrored = (output ?? found?.output) === "files" && rootDir !== undefined && outDir !== resolve(rootDir)
     let running = false
     let again = false
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -246,9 +401,10 @@ async function watchAndBuild(from: string | undefined): Promise<void> {
     await run()
     watch(folder, { recursive: true }, (_event, name) => {
         if (!name) return
-        const path = name.toString()
-        if (path.split(sep).includes("node_modules")) return
-        if (!/\.tilua$|tilua\.config\.jsonc?$|\.project\.json$/.test(path)) return
+        const path = resolve(folder, name.toString())
+        if (relative(folder, path).split(/[\\/]/).includes("node_modules") || isInside(outDir, path) && mirrored) return
+        const read = /\.tilua$|tilua\.config\.jsonc?$|\.project\.json$/.test(path) || (mirrored && isInside(rootDir!, path))
+        if (!read) return
         clearTimeout(timer)
         timer = setTimeout(() => void run(), 100)
     })
