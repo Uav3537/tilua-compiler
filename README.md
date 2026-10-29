@@ -13,9 +13,14 @@ npx tilua src/main.tilua --out build/main.luau
 ```
 
 ```
-tilua <entry> [--out <file>] [--output single|chunks|modules] [--config <tilua.config.json>]
-              [--noCheck] [--noLineMap]
+tilua [<entry>] [--out <file>] [--output single|chunks|files] [--config <tilua.config.json>]
+              [--noCheck] [--noLineMap] [--minify] [--watch]
+tilua init
 ```
+
+`--watch` builds again whenever a `.tilua` file, the config or a Rojo project
+changes, and keeps going. `tilua init` writes a `tilua.config.json` for the
+Rojo project in the folder — see `@tilua-types/roblox`.
 
 Every module the entry imports is bundled in. Problems are reported as
 `file:line:column message`. Type errors are checked against the config's
@@ -122,6 +127,11 @@ Luau without asking:
 | `1_000`, `0b101` | plain numbers | as written |
 | `@native` and other attributes | dropped | kept |
 | another file of the bundle | `loadfile` | `require` by path |
+
+Without such a library the output is printed as Lua 5.1, and the printer
+refuses what 5.1 has no syntax for: a `+=` let through, or a library's runtime
+written in Luau, stops the build with `The output cannot be written as Lua
+5.1: …` instead of failing on a Lua that cannot read it.
 
 An object's `freeze` does nothing on a Lua without `table.freeze`, and
 `isFrozen` answers `false`. `npm test` with `LUA51` naming a Lua 5.1
@@ -264,6 +274,18 @@ arguments. `globalCall` and `globalValue` answer for a global, such as
 `print(x)` or a bare `print`. A runtime can read `__LINES__` to reach the
 bundle's line map, and wraps a new array it answers with in `__ARRAY__(...)`. See the `@tilua/parser` README for the details.
 
+`entryExports` answers for what a bundle whose entry exports returns: it is
+handed that expression (`value`) and the entry's exports as an importer sees
+them, and may answer another expression and statements to put before it.
+`@tilua-types/luau` casts the exports table to its Luau type there, so a
+script that `require`s the bundle knows what it got.
+
+A library can add options to `tilua.config.json` by declaring them in its
+package.json — `"tilua": { "options": { "typedExports": { "type": "boolean",
+"default": true } } }` — and every hook is handed its library's own as
+`options`. A key no loaded library declares is an unknown option. See the
+`@tilua/parser` README.
+
 A library for a Lua with more syntax than 5.1's lists it, and the output uses
 it (see [Lua and Luau](#lua-and-luau)):
 
@@ -305,6 +327,15 @@ For a release nobody will debug, `"lineMap": false` in `tilua.config.json`
 everything that reads it: the entry runs without `xpcall`, a callback handed
 to Roblox is passed through unwrapped, and an error names the bundle's own
 lines, as plain Luau would.
+
+## Layout
+
+`"indent": "\t"` (or a number of spaces) indents the output a block level at
+a time; without it nothing is indented. `"minify": true` (or `--minify`, or
+`bundle({ minify: true })`) writes the whole output on one line, keeping a `;`
+only where the next statement starts with `(`. One line cannot be mapped back
+to the project's, so a minified bundle goes without the line map, as with
+`"lineMap": false`.
 
 ## Modules
 
@@ -401,21 +432,16 @@ says how many files the project becomes:
 |---|---|
 | `"single"` (default) | one, holding every module |
 | `"chunks"` | the entry's, holding what it reaches through `import` statements; one for each `import()` that leads somewhere else, holding what only it reaches; and one for what several of those share |
-| `"modules"` | one per module, in the project's own tree |
+| `"files"` | no entry: one per file under `rootDir`, in the same place under `outDir`, and the runtime — see [A file per module](#a-file-per-module) |
 
 ```
 tilua src/main.tilua --out build/main.luau --output chunks
 # build/main.luau, build/main_src_shop.luau, ...
-
-tilua src/main.tilua --out build --output modules
-# build/src/main.luau, build/src/shop.luau, ...
 ```
 
-With `"modules"`, `--out` is the folder the tree goes in — by default the
-project's, so each `.luau` lands beside its `.tilua`. From the API,
-`result.files` holds every file with the path it has to be written at, the
-entry's first; `outFile` names the entry's file, which the others are named
-after.
+From the API, `result.files` holds every file with the path it has to be
+written at, the entry's first; `outFile` names the entry's file, which the
+others are named after.
 
 The module table is the same one, filled by more than one file. The entry's
 file has the runtime; every other file is a function that adds its modules:
@@ -441,15 +467,84 @@ How a file is loaded depends on the Lua (see [Lua and Luau](#lua-and-luau)):
 Either way the files have to stay where they were written, relative to the
 entry's.
 
+## A file per module
+
+`"output": "files"` has no entry. Every `.tilua` under `rootDir` (a
+definitions file aside) becomes a `.luau` in the same place under `outDir`,
+as `tsc` writes `src` to `dist`, and each of them is a file a script can
+`require`:
+
+```jsonc
+{ "types": ["roblox"], "output": "files", "rootDir": "src", "outDir": "dist" }
+```
+
+```
+tilua            # the config above this folder says the rest
+# dist/main.luau, dist/shop/buy.luau, ..., dist/_tilua.luau
+```
+
+`rootDir` is the config's folder unless set, and `outDir` is `rootDir`, so
+each `.luau` lands beside its `.tilua`. Every file it writes ends with a line
+saying tilua wrote it: the CLI never replaces a `.luau` without that line —
+one written by hand — and removes one with it whose `.tilua` is gone. `--out` names the folder in place of
+`outDir`. From the API, `bundle({ output: "files", root })` without an
+`entry`; `result.files` holds every file, its path from `outDir`.
+
+The runtime — the module table, `require`, the line maps, and the helpers
+the modules share, the language's and the libraries' runtimes, each set up
+once — is a file of its own, `_tilua.luau`. Every other file requires it,
+takes the helpers it names from it, adds its module to the table, and returns
+the module's exports:
+
+```lua
+local G = require("../_tilua")
+G.modules["src/shop/buy"] = { load = function(exports)
+    local tax
+    tax = G.require("src/shop/tax", function()
+        return require("./tax")
+    end)
+    ...
+end }
+return G.run("src/shop/buy")
+```
+
+An `import` is still the runtime's `require`, so the modules behave as they
+do in one file: a cycle gets the exports as they stand (Luau's own `require`
+refuses one), and exports are live. The function after the name requires the
+module's file by its path from this one, written out for the tools that
+follow a `require`, and only if nothing has loaded it yet; an `import()` is
+the same, where it runs. `run` is `require` under `xpcall` for the first file
+asked for, so an error reaches the project's files once, however deep.
+
+A file named `init.tilua` is the folder it is in, as Luau reads `init.luau`:
+`import "./net"` finds `net/init.tilua`, the folder's files require it as
+`./net`, and it requires them as `@self/remote`.
+
+Where the files end up is the host's to say: a library's `files` hook can
+place each file somewhere else, name the top of that tree (`@game`), move
+the runtime, run something first in a file, and mark the files that are
+scripts the host runs rather than modules — nothing may import one.
+`@tilua-types/roblox` answers from a Rojo project.
+
+A file is required by its path, which Luau reads and Lua 5.1 does not: the
+output needs a library that says its Lua can (`requireByPath` — `"luau"`, or
+`"roblox"`, which loads it). A file imported from outside `rootDir` has no
+place under `outDir`, and is an error. Without an entry there is nothing to
+reach things from, so `treeShaking` leaves no module out; it still leaves out
+the runtime functions nothing calls.
+
+`@tilua-types/luau` casts what each file returns to its module's exports, so
+a script that requires any of them knows what it got.
+
 <!-- compatibility:start -->
 ## Compatibility
 
-`@tilua/compiler@8.1.0` works with these tilua packages. *Released with* is the
+`@tilua/compiler@9.0.0` works with these tilua packages. *Released with* is the
 version it was built and tested against.
 
 | Package | Range | Released with | |
 | --- | --- | --- | --- |
-| `@tilua/parser` | `^8.1.0` | 8.1.0 | dependency |
+| `@tilua/parser` | `^9.0.0` | 9.0.0 | dependency |
 <!-- compatibility:end -->
 
 ## Development

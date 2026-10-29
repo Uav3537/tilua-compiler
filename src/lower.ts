@@ -55,6 +55,12 @@ export interface ModuleContext {
     /** What `import("./x")` calls, with the module's name: the bundle's
      *  wrapper around its `require`. Default: `require` itself. */
     readonly import?: L.Expression
+    /** Where a module is a file of its own: a function, passed after its
+     *  name, that loads the file it is in — `function() return
+     *  require("./shape") end`, with the path written out, for the tools that
+     *  follow a `require`. `require` calls it only if the module is not
+     *  already there. */
+    loader?(name: string): L.Expression | undefined
     /** Luau reaching the bundle's line map — what a library's runtime reads,
      *  as `__LINES__`, to name the file a frame was written in. */
     readonly lines?: string
@@ -301,6 +307,13 @@ export interface ModuleInfo {
     readonly stars: string[]
     /** Whether the module exports anything. */
     exports: boolean
+}
+
+/** What `require` and `import` are called with for the module `name`: the
+ *  name, and the function that loads its file where it has one. */
+function moduleArguments(context: ModuleContext, name: string): L.Expression[] {
+    const loader = context.loader?.(name)
+    return loader ? [luau.string(name), loader] : [luau.string(name)]
 }
 
 export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerOptions = {}): LowerResult {
@@ -688,6 +701,7 @@ class Lowerer {
             const plugin = lowerings[i].plugin
             if (!plugin.methodCall) continue
             const answer = plugin.methodCall({
+                options: lowerings[i].options ?? {},
                 method,
                 receiver,
                 receiverGlobal,
@@ -718,6 +732,7 @@ class Lowerer {
             const plugin = lowerings[i].plugin
             if (!plugin.globalCall) continue
             const answer = plugin.globalCall({
+                options: lowerings[i].options ?? {},
                 name,
                 at: this.callSite(node.callee),
                 get arguments() { return info() },
@@ -736,6 +751,7 @@ class Lowerer {
         if (name === undefined) return undefined
         for (let i = lowerings.length - 1; i >= 0; i--) {
             const answer = lowerings[i].plugin.globalValue?.({
+                options: lowerings[i].options ?? {},
                 name,
                 at: this.callSite(node),
                 use: runtime => this.loweringRuntime(i, runtime),
@@ -1030,13 +1046,13 @@ end`).body.statements, out)
                 local = this.names.fresh(moduleName(key))
                 moduleLocals.set(key, local)
                 locals.push(local)
-                requires.push(luau.assign([luau.identifier(local)], [luau.call(context.require, [luau.string(key)])]))
+                requires.push(luau.assign([luau.identifier(local)], [luau.call(context.require, moduleArguments(context, key))]))
             }
             return local
         }
         /** Loaded for its place in the order only: its exports are linked, not read here. */
         const load = (key: string): void => {
-            if (!moduleLocals.has(key)) requires.push(luau.callStatement(luau.call(context.require, [luau.string(key)])))
+            if (!moduleLocals.has(key)) requires.push(luau.callStatement(luau.call(context.require, moduleArguments(context, key))))
         }
 
         const exportBinding = (node: object | undefined, exported: string): void => {
@@ -1169,22 +1185,24 @@ end`).body.statements, out)
                 // The class table is built where it is written — its
                 // initializers and its base class have to have run — but the
                 // name is already declared, so anything above it can reach it.
-                body.push(...this.classDeclaration(declaration, "assign"))
+                body.push(...this.classDeclaration(declaration, "assign").map(s => this.from(s, declaration)))
                 continue
             }
             switch (declaration.type) {
+                // Stamped with where they were written, as any statement is:
+                // an error in a top-level `const` names its line.
                 case "VariableDeclaration":
-                    body.push(...this.variableDeclaration(declaration, "assign"))
+                    body.push(...this.variableDeclaration(declaration, "assign").map(s => this.from(s, declaration)))
                     break
                 case "ExportDefaultStatement": {
                     // `export default class Name ... end` builds the class
                     // under its name, then exports that.
                     const exported = declaration.declaration
                     if (exported.type === "ClassDeclaration") {
-                        body.push(...this.classDeclaration(exported, "assign"))
-                        body.push(luau.assign([luau.member(exportsTable(), "default")], [this.reference(exported.name)]))
+                        body.push(...this.classDeclaration(exported, "assign").map(s => this.from(s, exported)))
+                        body.push(this.from(luau.assign([luau.member(exportsTable(), "default")], [this.reference(exported.name)]), declaration))
                     } else {
-                        body.push(luau.assign([luau.member(exportsTable(), "default")], [this.expression(exported)]))
+                        body.push(this.from(luau.assign([luau.member(exportsTable(), "default")], [this.expression(exported)]), declaration))
                     }
                     break
                 }
@@ -1225,7 +1243,7 @@ end`).body.statements, out)
             this.report(source, `Cannot find module '${source.value}'`)
             return luau.nil()
         }
-        return luau.call(context.import ?? context.require, [luau.string(key)])
+        return luau.call(context.import ?? context.require, moduleArguments(context, key))
     }
 
     private isRewritten(node: object): boolean {

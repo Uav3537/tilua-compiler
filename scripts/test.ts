@@ -69,40 +69,14 @@ function validLuau(name: string, code: string): void {
     }
 }
 
-/** Every Luau-only thing, as the node it parses to. Parsing the output with
- *  luau-parser only proves it is valid *Luau* — and Luau is a superset, so a
- *  `+=` left in by mistake would sail through. Without a Lua 5.1 interpreter to
- *  hand, walking the tree for what 5.1 has no syntax for is the next best
- *  thing, and it says exactly which construct survived. */
-const LUAU_ONLY: Record<string, (node: Record<string, unknown>) => boolean> = {
-    CompoundAssignmentStatement: () => true,
-    ContinueStatement: () => true,
-    IfElseExpression: () => true,
-    BinaryExpression: node => node.operator === "//",
-    NumberLiteral: node => typeof node.raw === "string" && (node.raw.includes("_") || /^0[bB]/.test(node.raw)),
-    FunctionDeclarationStatement: node => Array.isArray(node.attributes) && node.attributes.length > 0,
-    LocalFunctionStatement: node => Array.isArray(node.attributes) && node.attributes.length > 0,
-}
-
+/** Parsing the output as Luau only proves it is valid *Luau* — a superset, so
+ *  a `+=` left in by mistake would sail through. Parsed as Lua 5.1, anything
+ *  5.1 has no syntax for is refused, and named. */
 function validLua51(name: string, code: string): void {
-    const found = new Set<string>()
-    const walk = (value: unknown): void => {
-        if (!value || typeof value !== "object") return
-        if (Array.isArray(value)) return void value.forEach(walk)
-        const node = value as Record<string, unknown>
-        const rejects = typeof node.type === "string" ? LUAU_ONLY[node.type] : undefined
-        if (rejects?.(node)) found.add(String(node.type) + (node.operator ? ` '${node.operator}'` : ""))
-        for (const [key, child] of Object.entries(node)) {
-            if (key !== "line" && key !== "column") walk(child)
-        }
-    }
     try {
-        walk(parseLuau(code))
-    } catch {
-        return // validLuau reports the parse failure itself
-    }
-    if (found.size) {
-        failures.push(`${name}\n    Lua 5.1 output still has: ${[...found].join(", ")}\n${code}`)
+        parseLuau(code, { syntax: "lua51" })
+    } catch (error) {
+        failures.push(`${name}\n    output is not Lua 5.1: ${(error as Error).message}\n${code}`)
     }
 }
 
@@ -682,6 +656,122 @@ runs("try: catch, finally, jumps out of it and nesting run as in JavaScript", aw
     }
 }
 
+// How the output is laid out: indented, or minified onto one line — which
+// runs the same, and goes without the map one line cannot have.
+{
+    const files = {
+        "src/util.tilua": "export function pick(xs: number[]): number {\n    for (const x of xs) {\n        if (x > 1) return x\n    }\n    return 0\n}\n",
+        "src/main.tilua": `import { pick } from "./util"\nconst found = pick([1, 5, 9])\nprint(found, (found))\n`,
+    }
+    const plain = await bundle({ entry: join(project({ ...files, "tilua.config.json": "{}" }), "src/main.tilua"), typeCheck: false })
+    const tabbed = await bundle({
+        entry: join(project({ ...files, "tilua.config.json": JSON.stringify({ indent: "\t" }) }), "src/main.tilua"), typeCheck: false,
+    })
+    const minified = await bundle({ entry: join(project({ ...files, "tilua.config.json": "{}" }), "src/main.tilua"), typeCheck: false, minify: true })
+    check("indent: a block's lines are indented, and nothing else changes", [
+        /\n\t+if x > 1 then\n\t+return x;/.test(tabbed.code ?? ""),
+        (tabbed.code ?? "").replace(/^\t+/gm, "") === plain.code,
+    ], [true, true])
+    check("minify: one line, without the map or xpcall", [
+        (minified.code ?? "").trim().includes("\n"),
+        /lineMap|xpcall/.test(minified.code ?? "lineMap"),
+        (minified.code ?? "").length < (plain.code ?? "").length,
+    ], [false, false, true])
+    runs("indent: the indented bundle runs", tabbed, ["5\t5"])
+    runs("minify: the minified bundle runs — `(found)` after a call keeps its `;`", minified, ["5\t5"])
+    if (minified.code !== undefined) validLua51("minify: the minified bundle is Lua 5.1", minified.code)
+}
+
+// A library's options: declared in its package.json, set in the config,
+// checked against what the libraries declare, and handed to its hooks — here
+// `entryExports`, which answers for what a bundle's entry returns.
+{
+    const library = mkdtempSync(join(tmpdir(), "tilua-options-"))
+    writeFileSync(join(library, "package.json"), JSON.stringify({
+        name: "with-options",
+        tilua: {
+            types: "index.d.tilua",
+            lowering: "lowering.mjs",
+            options: {
+                tagged: { type: "boolean", default: true },
+                tag: { type: "string", values: ["a", "b"], default: "a" },
+            },
+        },
+    }))
+    writeFileSync(join(library, "index.d.tilua"), "")
+    writeFileSync(join(library, "lowering.mjs"), [
+        "export default {",
+        "    entryExports({ value, exports, options, syntax }) {",
+        "        if (!options.tagged) return undefined",
+        "        const names = [...exports.values.keys()].join(',')",
+        "        return {",
+        "            statements: [`local tag = \"${options.tag}:${names}:${syntax.length}\"`],",
+        "            value: `(function(e) print(tag) return e end)(${value})`,",
+        "        }",
+        "    },",
+        "}",
+    ].join("\n"))
+    const files = { "src/main.tilua": "export const one = 1\nexport function two() { return 2 }\n" }
+    const build = (config: object, lineMap = false) =>
+        bundle({ entry: join(project({ ...files, "tilua.config.json": JSON.stringify(config) }), "src/main.tilua"), lineMap })
+
+    const defaults = await build({ types: [library] })
+    check("library options: the defaults reach the hook, with the entry's exports", [
+        defaults.diagnostics.map(d => d.message),
+        (defaults.code ?? "").includes("local tag = \"a:one,two:0\""),
+        /\nreturn \(function\(e\)[\s\S]*\nend\)\(G\.require\("src\/main"\)\);/.test(defaults.code ?? ""),
+    ], [[], true, true])
+    runs("library options: what the hook answered runs", defaults, ["a:one,two:0"])
+    runs("library options: with the line map, the hook is handed what xpcall answered",
+        await build({ types: [library], tag: "b" }, true), ["b:one,two:0"])
+
+    const off = await build({ types: [library], tagged: false })
+    check("library options: the config sets them", [
+        off.diagnostics.map(d => d.message),
+        /local tag|print\(tag\)/.test(off.code ?? "tag"),
+        (off.code ?? "").includes("return G.require(\"src/main\")"),
+    ], [[], false, true])
+
+    const wrong = await build({ types: [library], tagged: "yes", tag: "c", nope: 1 })
+    check("library options: a wrong value, and a key no library declares, are reported", wrong.diagnostics.map(d => d.message), [
+        "'tagged' must be true or false (an option of 'with-options')",
+        "'tag' must be one of: \"a\", \"b\" (an option of 'with-options')",
+        "Unknown option 'nope'. Options are: types, paths, baseUrl, sourceMap, output, rootDir, outDir, noLib, treeShaking, lineMap, indent, minify, tagged, tag",
+    ])
+    check("library options: a wrong value keeps the default",
+        (wrong.code ?? "").includes("local tag = \"a:one,two:0\""), true)
+
+    const without = await build({ tagged: false })
+    check("library options: without the library that declares it, an option is unknown",
+        without.diagnostics.map(d => d.message), [
+            "Unknown option 'tagged'. Options are: types, paths, baseUrl, sourceMap, output, rootDir, outDir, noLib, treeShaking, lineMap, indent, minify",
+        ])
+}
+
+// Without a library that says its Lua has more, the output is Lua 5.1, and a
+// runtime written in Luau is refused at build time, not on a Lua that cannot
+// read it.
+{
+    const library = mkdtempSync(join(tmpdir(), "tilua-luau-runtime-"))
+    writeFileSync(join(library, "package.json"), JSON.stringify({ name: "luau-runtime", tilua: { types: "index.d.tilua", lowering: "lowering.mjs" } }))
+    writeFileSync(join(library, "index.d.tilua"), "declare function bump(n: number): number\n")
+    writeFileSync(join(library, "lowering.mjs"), [
+        "export default {",
+        "    runtime: { bump: 'local __NAME__ = {}\\nfunction __NAME__.bump(n)\\n    n += 1\\n    return n\\nend' },",
+        "    globalCall: call => call.name === 'bump' ? { callee: `${call.use('bump')}.bump` } : undefined,",
+        "}",
+    ].join("\n"))
+    const root = project({ "src/main.tilua": "print(bump(1))\n", "tilua.config.json": JSON.stringify({ types: [library] }) })
+    const refused = await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false })
+    check("lua51: Luau syntax in the output is refused, and named", [
+        refused.code === undefined,
+        refused.diagnostics.some(d => d.message.startsWith("The output cannot be written as Lua 5.1: compound assignment")),
+    ], [true, true])
+    writeFileSync(join(root, "tilua.config.json"), JSON.stringify({ types: [library, LUAU] }))
+    runs("lua51: with a library that says its Lua is Luau, the same runtime is written",
+        await bundle({ entry: join(root, "src/main.tilua"), typeCheck: false }), ["2"])
+}
+
 // The map is written packed, and read back the first time a line is looked
 // up: every line of a big bundle, across files, and lines that go back up a
 // file (a hoisted function), each read back where it was written.
@@ -778,6 +868,8 @@ function readLineMap(code: string): Map<number, string> {
     const resolved = [...map].sort((a, b) => a[0] - b[0])
         .map(([line, origin]) => `${(lines[line - 1] ?? "").trim()} -> ${origin}`)
     check("line map: each bundled line points back at the source that wrote it", resolved, [
+        // A module's top-level `const`, as much as any statement.
+        "start = 2; -> src/main.tilua:2",
         "print((util.twice(start))); -> src/main.tilua:3",
         "function exports.twice(n) -> src/util.tilua:1",
         "local doubled = n * 2; -> src/util.tilua:2",
@@ -1890,8 +1982,9 @@ await lowersMarked("typeof: an array is written down as one where it is made",
 // written as the bundler names them. `LUA51` naming a Lua 5.1 interpreter runs
 // each of them built for that target as well.
 
-/** Write every file of `result` where it says, and run the entry's. */
-function runFiles(name: string, result: BundleResult, binary: string | undefined): string[] | undefined {
+/** Write every file of `result` where it says, and run the entry's — or,
+ *  for output without an entry, `runner`: Luau written beside the files. */
+function runFiles(name: string, result: BundleResult, binary: string | undefined, runner?: string): string[] | undefined {
     if (result.code === undefined) {
         failures.push(`${name}\n    no bundle: ${result.diagnostics.map(d => `${d.line}:${d.column} ${d.message}`).join("; ")}`)
         return undefined
@@ -1906,7 +1999,8 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
         mkdirSync(dirname(join(folder, file.path)), { recursive: true })
         writeFileSync(join(folder, file.path), file.code)
     }
-    const entryFile = join(folder, result.files[0].path)
+    if (runner !== undefined) writeFileSync(join(folder, "run.luau"), runner)
+    const entryFile = join(folder, runner !== undefined ? "run.luau" : result.files[0].path)
     try {
         // From the entry's own folder: Luau reads a `require`d path from the
         // file that asks, and names that file from where it was started.
@@ -1970,11 +2064,24 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
         chunks.files[1]?.code.startsWith("return function(G)"), true)
     check("chunks: the same program", runFiles("chunks: the same program", chunks, luauBinary) ?? expected, expected)
 
-    const modules = await bundle({ entry, output: "modules", root, config: { types: [LUAU] } })
-    check("modules: a file for each, in the project's tree", modules.files.map(f => f.path),
-        ["src/main.luau", "src/util.luau", "src/shop/buy.luau", "src/extra.luau", "src/side.luau", "src/shop/tax.luau"])
-    check("modules: named from the entry's own file", modules.code?.includes(`["src/shop/tax"] = "./shop/tax"`), true)
-    check("modules: the same program", runFiles("modules: the same program", modules, luauBinary) ?? expected, expected)
+    // No entry: every file under `rootDir` is a file of its own, which
+    // requires the runtime and returns its exports.
+    const perFile = await bundle({ output: "files", root, config: { types: [LUAU] } })
+    check("files: a file for each, in the project's tree, and the runtime", perFile.files.map(f => f.path), [
+        "src/extra.luau", "src/main.luau", "src/shop/buy.luau", "src/shop/tax.luau", "src/side.luau", "src/util.luau", "_tilua.luau",
+    ])
+    const buyFile = perFile.files.find(f => f.path === "src/shop/buy.luau")?.code ?? ""
+    check("files: each requires the runtime, and what it imports by the path from its own file", [
+        buyFile.startsWith("local G = require(\"../../_tilua\");"),
+        /G\.require\("src\/util", function\(\)\s*return require\("\.\.\/util"\);\s*end\)/.test(buyFile),
+        /G\.require\("src\/shop\/tax", function\(\)\s*return require\("\.\/tax"\);\s*end\)/.test(buyFile),
+        /\nreturn G\.run\("src\/shop\/buy"\);\n-- Written by tilua from buy\.tilua: edit that file, not this one\.\n$/.test(buyFile),
+        (perFile.files.at(-1)?.code ?? "").endsWith("return G;\n-- Written by tilua: the runtime every file of the project requires.\n"),
+    ], [true, true, true, true, true])
+    check("files: the same program", runFiles("files: the same program", perFile, luauBinary, `require("./src/main")`) ?? expected, expected)
+    const direct = runFiles("files: any file is one a script can require", perFile, luauBinary,
+        `local buy = require("./src/shop/buy")\nprint(buy.price("hat"), buy.default, require("./src/shop/buy") == buy)`)
+    if (direct) check("files: any file is one a script can require, and gets its exports", direct, ["tax loaded", "buy loaded", "27\tshop\ttrue"])
 
     const configured = await bundle({ entry: join(project({ ...files, "tilua.config.json": JSON.stringify({ types: [], output: "chunks" }) }), "src/main.tilua") })
     check("output: the config's, without an option", configured.files.length, 5)
@@ -1982,11 +2089,135 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
     // Without a library saying more, another file is loaded with
     // `loadfile`, which every Lua but Luau has.
     const lua51Binary = process.env.LUA51
-    for (const output of ["single", "chunks", "modules"] as const) {
+    for (const output of ["single", "chunks"] as const) {
         const built = await bundle({ entry, output })
         check(`lua51: ${output}, loaded with loadfile`, output === "single" || built.code?.includes("loadfile(folder .. file)"), true)
         if (lua51Binary) check(`lua51: ${output} runs`, runFiles(`lua51: ${output} runs`, built, lua51Binary), expected)
     }
+    // A file a script requires by its path: Lua 5.1's `require` takes none.
+    const lua51Files = await bundle({ output: "files", root, config: { types: [] } })
+    check("lua51: files is refused, and says what would do", [lua51Files.files.length, lua51Files.diagnostics.map(d => d.message)], [0, [
+        "\"output\": \"files\" needs a Lua that requires a file by its path, which Lua 5.1 does not — add \"luau\" to 'types' (\"roblox\" loads it)",
+    ]])
+}
+
+// `"files"`: `rootDir` and `outDir`, a cycle across files, and what has no
+// place in the output.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [LUAU], output: "files", rootDir: "src", outDir: "dist" }),
+        "src/main.tilua": `import { count, tick } from "./counter"\nimport { peek } from "./peek"\ntick()\nprint(count, peek())\nexport const done = true\n`,
+        // `counter` and `peek` import each other: a cycle Luau's own
+        // `require` refuses, which the runtime's answers as ES modules do.
+        "src/counter.tilua": `import { peek } from "./peek"\nexport let count = 0\nexport function tick() { count = count + 1 }\nexport function twice(): number { return peek() * 2 }\n`,
+        "src/peek.tilua": `import { count } from "./counter"\nexport function peek(): number { return count }\n`,
+        "src/types.d.tilua": `declare const nothing: number\n`,
+    })
+    const result = await bundle({ root })
+    check("files: from the config, with paths from rootDir, and no definitions file", [
+        result.diagnostics.map(d => d.message), result.files.map(f => f.path),
+    ], [[], ["counter.luau", "main.luau", "peek.luau", "_tilua.luau"]])
+    const ran = runFiles("files: a cycle across files", result, luauBinary,
+        `local main = require("./main")\nlocal counter = require("./counter")\ncounter.tick()\nprint(main.done, counter.count, counter.twice())`)
+    if (ran) check("files: a cycle across files, and live bindings", ran, ["1\t1", "true\t2\t4"])
+
+    const outside = await bundle({
+        root: project({
+            "tilua.config.json": JSON.stringify({ types: [LUAU], output: "files", rootDir: "src" }),
+            "src/main.tilua": `import { a } from "../shared/a"\nprint(a)\n`,
+            "shared/a.tilua": `export const a = 1\n`,
+        }),
+    })
+    check("files: a file imported from outside rootDir is refused", [outside.files.length, outside.diagnostics.map(d => d.message)], [0, [
+        "This file is imported, but it is outside rootDir (src), where every file of \"files\" output has to be",
+    ]])
+    const noEntry = await bundle({ root: project({ "tilua.config.json": "{}", "main.tilua": "print(1)\n" }) })
+    check("files: only it builds without an entry", noEntry.diagnostics.map(d => d.message),
+        ["No entry to build: only \"output\": \"files\" builds without one"])
+    const gone = await bundle({ root: project({ "tilua.config.json": JSON.stringify({ output: "modules" }), "main.tilua": "print(1)\n" }) })
+    check("files: 'modules' is gone, and says what took its place", gone.diagnostics.map(d => d.message)[0],
+        "'modules' is gone: \"files\" writes one file per module, each of which returns its exports")
+}
+
+// `init.tilua` is the folder it is in, as Luau reads `init.luau`: a folder
+// imports it by its own name, and it reaches what is under it by `@self`.
+{
+    const root = project({
+        "tilua.config.json": JSON.stringify({ types: [LUAU], output: "files", rootDir: "src" }),
+        "src/main.tilua": `import { hello } from "./net"\nimport { util } from "./net/util"\nprint(hello(), util())\n`,
+        "src/net/init.tilua": `import { util } from "./util"\nimport { name } from "../shared"\nexport function hello(): string { return \`hello \${util()} \${name}\` }\n`,
+        "src/net/util.tilua": `import { name } from "../shared"\nexport function util(): string { return name + "!" }\n`,
+        "src/shared.tilua": `export const name = "shared"\n`,
+    })
+    const result = await bundle({ root })
+    const code = (path: string): string => result.files.find(f => f.path === path)?.code ?? ""
+    const requires = (path: string): string[] => [...code(path).matchAll(/require\("([^"]+)"\)/g)].map(m => m[1])
+    check("files: init is the folder — @self below it, ./ beside it", [
+        result.diagnostics.map(d => d.message),
+        requires("net/init.luau"), requires("net/util.luau"), requires("main.luau"),
+    ], [[], ["./_tilua", "@self/util", "./shared"], ["../_tilua", "../shared"], ["./_tilua", "./net", "./net/util"]])
+    const ran = runFiles("files: an init module runs as Luau reads it", result, luauBinary, `require("./main")`)
+    if (ran) check("files: an init module runs as Luau reads it", ran, ["hello shared! shared\tshared!"])
+}
+
+// A host that puts the files somewhere else says where (`files`): each file's
+// place, the alias of the top, where the runtime goes, what runs first, and
+// which files are scripts it runs rather than modules.
+{
+    const library = mkdtempSync(join(tmpdir(), "tilua-host-"))
+    writeFileSync(join(library, "package.json"), JSON.stringify({ name: "host", tilua: { types: "index.d.tilua", lowering: "lowering.mjs" } }))
+    writeFileSync(join(library, "index.d.tilua"), "")
+    writeFileSync(join(library, "lowering.mjs"), [
+        `import { relative, join } from "node:path"`,
+        `export default {`,
+        `    syntax: ["requireByPath"],`,
+        `    files({ outDir, files }) {`,
+        `        const top = { shared: "Shared", server: "Server" }`,
+        `        return {`,
+        `            root: "@top",`,
+        `            runtime: join(outDir, "shared", "_tilua.luau"),`,
+        `            place: file => {`,
+        `                const parts = relative(outDir, file).split(/[\\\\/]/)`,
+        `                const name = parts.pop().replace(/(\\.server)?\\.luau$/, "")`,
+        `                return [top[parts[0]], ...parts.slice(1), name]`,
+        `            },`,
+        `            prelude: file => file.endsWith(".server.luau") ? "local started = true" : undefined,`,
+        `            script: file => file.endsWith(".server.luau"),`,
+        `            problems: [{ message: \`\${files.length} files\`, severity: "warning" }],`,
+        `        }`,
+        `    },`,
+        `}`,
+    ].join("\n"))
+    const files = {
+        "tilua.config.json": JSON.stringify({ types: [library], output: "files", rootDir: "src", outDir: "out" }),
+        "src/shared/util.tilua": `export function twice(n: number): number { return n * 2 }\n`,
+        "src/shared/math/add.tilua": `import { twice } from "../util"\nexport function add(n: number): number { return twice(n) + 1 }\n`,
+        "src/server/main.server.tilua": `import { add } from "../shared/math/add"\nprint(add(1))\n`,
+    }
+    const result = await bundle({ root: project(files) })
+    const code = (path: string): string => result.files.find(f => f.path === path)?.code ?? ""
+    const requires = (path: string): string[] => [...code(path).matchAll(/require\("([^"]+)"\)/g)].map(m => m[1])
+    check("files: a host's layout — places, the top's alias, the runtime, what runs first", [
+        result.diagnostics.map(d => [d.message, d.severity]),
+        result.files.map(f => f.path),
+        requires("shared/math/add.luau"),
+        requires("server/main.server.luau"),
+        code("server/main.server.luau").startsWith("local started = true;\nlocal G = require(\"@top/Shared/_tilua\");"),
+    ], [
+        [["3 files", "warning"]],
+        ["server/main.server.luau", "shared/math/add.luau", "shared/util.luau", "shared/_tilua.luau"],
+        ["../_tilua", "../util"],
+        ["@top/Shared/_tilua", "@top/Shared/math/add"],
+        true,
+    ])
+
+    const importsScript = await bundle({ root: project({
+        ...files,
+        "src/shared/uses.tilua": `import "../server/main.server"\nexport const x = 1\n`,
+    }) })
+    check("files: nothing imports a script the host runs", [importsScript.files.length, importsScript.diagnostics.filter(d => d.category === "module").map(d => `${d.line}:${d.column} ${d.message}`)], [0, [
+        "1:8 '../server/main.server' is a script the game runs, which nothing can import: move what it shares into a module of its own",
+    ]])
 }
 
 // An error in a file that is not the entry's is still reported in the project's.
@@ -1996,8 +2227,11 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
         "src/main.tilua": `function boom() {\n    import("./shop/broken").fail(nil)\n}\nboom()\n`,
         "src/shop/broken.tilua": `export function fail(inner: any) {\n    return inner.value\n}\n`,
     })
-    for (const output of ["chunks", "modules"] as const) {
-        const ran = runFiles(`${output}: an error in another file`, await bundle({ entry: join(root, "src/main.tilua"), output, root, config: { types: [LUAU] } }), luauBinary)
+    for (const output of ["chunks", "files"] as const) {
+        const built = await bundle({ entry: output === "files" ? undefined : join(root, "src/main.tilua"), output, root, config: { types: [LUAU] } })
+        const ran = runFiles(`${output}: an error in another file`, built, luauBinary, output === "files" ? `require("./src/main")` : undefined)
+            // A file `require`d by path: Luau says it was running one.
+            ?.map(line => line.replace(/^.*error while running module: /, ""))
         if (ran) {
             check(`${output}: an error in another file names the project's`, ran.slice(0, 4), [
                 "src/shop/broken.tilua:2: attempt to index nil with 'value'",
@@ -2246,10 +2480,23 @@ await lowers("^: a length or a negation on its left is bracketed",
     check("shared helpers: each defined once",
         ["local tilua_array = {}", "local function tilua_asArray(", "local function tilua_typeof(", "local function tilua_class("].map(text => count(single.code ?? "", text)),
         [1, 1, 1, 1])
-    for (const output of ["chunks", "modules"] as const) {
-        const result = await bundle({ entry, output, root, config: { types: [LUAU] } })
-        check(`shared helpers (${output}): each file defines what its modules use`, result.files.every(f => f.code.includes("tilua_array = (function()")), true)
-        const ran = runFiles(`shared helpers (${output})`, result, luauBinary)
+    for (const output of ["chunks", "files"] as const) {
+        const result = await bundle({ entry: output === "files" ? undefined : entry, output, root, config: { types: [LUAU] } })
+        if (output === "chunks") {
+            check("shared helpers (chunks): each file defines what its modules use",
+                result.files.every(f => f.code.includes("tilua_array = (function()")), true)
+        } else {
+            // One runtime file, required by every other: the helpers are
+            // defined there once, and each file takes the ones it names.
+            const count = (code: string, text: string): number => code.split(text).length - 1
+            const runtimeFile = result.files.find(f => f.path === "_tilua.luau")?.code ?? ""
+            check("shared helpers (files): defined once, in the runtime, and taken from it", [
+                count(runtimeFile, "tilua_array = (function()"),
+                result.files.filter(f => f !== result.files.find(g => g.path === "_tilua.luau")).some(f => f.code.includes("(function()\nlocal tilua_array")),
+                /\nlocal [\w, ]*\btilua_array\b[\w, ]* = [\w., ]*\bG\.shared\.tilua_array\b/.test(result.files.find(f => f.path === "src/a.luau")?.code ?? ""),
+            ], [1, false, true])
+        }
+        const ran = runFiles(`shared helpers (${output})`, result, luauBinary, output === "files" ? `require("./src/main")` : undefined)
         if (ran) check(`shared helpers (${output}): runs as before`, ran, expected)
     }
 }

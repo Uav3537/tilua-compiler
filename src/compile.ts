@@ -11,8 +11,8 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { parse, analyzeScopes, analyzeTypes, resolveTypeLibraries, ParseError, LexError } from "@tilua/parser"
-import { print } from "luau-parser"
-import { lower } from "./lower.js"
+import { lower, syntaxOf } from "./lower.js"
+import { printOptions, printOutput } from "./output.js"
 import { loadLowerings } from "./lowering.js"
 import { resolveConfig, type ConfigInput } from "./config.js"
 import * as luau from "./luau.js"
@@ -49,7 +49,7 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
         message: d.message, line: d.node.line.start, column: d.node.column.start,
     }))
 
-    const libraries = resolved ? resolveTypeLibraries(resolved) : { files: [], lowerings: [], problems: [] }
+    const libraries = resolved ? resolveTypeLibraries(resolved) : { files: [], lowerings: [], options: [], problems: [] }
     const { lowerings, problems: loweringProblems } = await loadLowerings(libraries.lowerings)
     for (const p of [...problems, ...libraries.problems]) {
         diagnostics.push({ message: p.message, line: p.line ?? 1, column: p.column ?? 1 })
@@ -65,5 +65,9 @@ export async function compile(source: string, config?: ConfigInput): Promise<Com
     })
     diagnostics.push(...lowered.diagnostics)
     if (diagnostics.length) return { diagnostics }
-    return { code: print(luau.program(lowered.statements)) + "\n", diagnostics }
+    const printed = printOutput(luau.program(lowered.statements), printOptions(syntaxOf(lowerings), {
+        indent: resolved?.indent, minify: resolved?.minify,
+    }))
+    if ("problem" in printed) return { diagnostics: [{ message: printed.problem, line: 1, column: 1 }] }
+    return { code: printed.code + "\n", diagnostics }
 }

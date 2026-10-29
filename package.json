@@ -1,6 +1,6 @@
 {
   "name": "@tilua/compiler",
-  "version": "8.1.0",
+  "version": "9.0.0",
   "description": "Compiles tilua to Luau: lowers the @tilua/parser AST to a luau-parser AST and prints it",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -37,8 +37,8 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "luau-parser": "^1.0.3",
-    "@tilua/parser": "^8.1.0"
+    "@tilua/parser": "^9.0.0",
+    "luau-parser": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",

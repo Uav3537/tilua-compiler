@@ -35,20 +35,29 @@ export interface Origin {
  *  them — the risk with walking a built tree and a parsed one is that their
  *  keys are in different orders, and using the same walk removes it. */
 function statementsOf(node: unknown): Statement[] {
-    const out: Statement[] = []
-    const visit = (value: unknown): void => {
+    return statementTree(node).statements
+}
+
+/** Every statement under `node`, in order, and the index of the statement
+ *  each is inside (-1 for none). */
+function statementTree(node: unknown): { statements: Statement[]; parents: number[] } {
+    const statements: Statement[] = []
+    const parents: number[] = []
+    const visit = (value: unknown, parent: number): void => {
         if (!value || typeof value !== "object") return
-        if (Array.isArray(value)) return void value.forEach(visit)
+        if (Array.isArray(value)) return void value.forEach(item => visit(item, parent))
         const record = value as Record<string, unknown>
+        let inside = parent
         if (typeof record.type === "string" && record.type.endsWith("Statement")) {
-            out.push(value as Statement)
+            inside = statements.push(value as Statement) - 1
+            parents.push(parent)
         }
         for (const [key, child] of Object.entries(record)) {
-            if (key !== "line" && key !== "column") visit(child)
+            if (key !== "line" && key !== "column") visit(child, inside)
         }
     }
-    visit(node)
-    return out
+    visit(node, -1)
+    return { statements, parents }
 }
 
 /**
@@ -63,7 +72,7 @@ export function buildLineMap(
     printed: Program,
     origins: WeakMap<Statement, Origin>,
 ): Map<number, Origin> {
-    const before = statementsOf(emitted)
+    const { statements: before, parents } = statementTree(emitted)
     const after = statementsOf(printed)
     if (before.length !== after.length) return new Map()
 
@@ -77,6 +86,22 @@ export function buildLineMap(
         // The first statement on a line wins: a line holding several is read
         // as starting where the first of them did.
         if (!map.has(line)) map.set(line, origin)
+    }
+    // A statement written over several lines that holds no statement of the
+    // project's own is all of it the one line it came from — a call whose
+    // argument is a function the compiler wrote, say, which Luau reports at
+    // the line the call ends on.
+    const holds = new Set<number>()
+    for (let i = 0; i < before.length; i++) {
+        if (!origins.has(before[i])) continue
+        for (let up = parents[i]; up >= 0 && !holds.has(up); up = parents[up]) holds.add(up)
+    }
+    for (let i = 0; i < before.length; i++) {
+        const origin = origins.get(before[i])
+        if (!origin || holds.has(i)) continue
+        for (let line = after[i].line.start + 1; line <= after[i].line.end; line++) {
+            if (!map.has(line)) map.set(line, origin)
+        }
     }
     return map
 }

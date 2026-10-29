@@ -16,8 +16,15 @@ export interface TiluaConfigJson {
     sourceMap?: string | null
     /** How many files the output is. `"single"` (the default) is one file;
      *  `"chunks"` also writes a file for what only an `import()` reaches,
-     *  loaded when it is first asked for; `"modules"` writes one per module. */
+     *  loaded when it is first asked for; `"files"` has no entry, and
+     *  compiles every file under `rootDir` to one of its own under `outDir`. */
     output?: OutputMode
+    /** With `"files"`, the folder whose files are compiled. Default: the
+     *  config's folder. */
+    rootDir?: string
+    /** With `"files"`, the folder the output goes in, laid out as `rootDir`
+     *  is. Default: `rootDir`, each `.luau` beside its `.tilua`. */
+    outDir?: string
     /** Leave out Lua's standard library — `print`, `string`, `pcall` — which
      *  is otherwise there for every file, as JavaScript's is in TypeScript. */
     noLib?: boolean
@@ -26,6 +33,15 @@ export interface TiluaConfigJson {
     /** Write the map from the bundle's lines back to the project's, which
      *  error reports and `console` read. Default: true. */
     lineMap?: boolean
+    /** Indent the output, a block level at a time: `"\t"` or a number of
+     *  spaces. Default: no indentation. */
+    indent?: "\t" | number
+    /** Write the output on one line, with as few `;` as it can take, and
+     *  without the line map. Default: false. */
+    minify?: boolean
+    /** The options a type library in `types` declares, such as
+     *  `@tilua-types/luau`'s `typedExports`. */
+    [option: string]: unknown
 }
 
 /** A config file's path, or the config itself. Relative paths — to a config

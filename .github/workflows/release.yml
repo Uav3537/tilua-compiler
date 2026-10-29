@@ -9,6 +9,11 @@ permissions:
   contents: read
   id-token: write
 
+# Only installs, builds and publishes. The tests are not run here: the release
+# script (publish-tilua.mjs) runs build, typecheck and test on every package
+# before anything is pushed, and then again in an empty directory from the
+# lockfile (`rehearse`), which is this job minus the publish. Running them a
+# third time here only made each release wait on a slow runner.
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -20,9 +25,6 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
-
-      - name: Update npm
-        run: npm install -g npm@latest
 
       - name: Check Version
         id: check
@@ -41,20 +43,20 @@ jobs:
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # A push that did not bump the version publishes nothing, so it has
+      # nothing to install or build either.
+      - name: Update npm
+        if: steps.check.outputs.should_publish == 'true'
+        run: npm install -g npm@latest
+
       - name: Install Dependencies
+        if: steps.check.outputs.should_publish == 'true'
         run: npm ci
 
       - name: Build
+        if: steps.check.outputs.should_publish == 'true'
         run: npm run build
-      
-      - name: TypeCheck
-        run: npm run typecheck
 
-      - name: Test
-        run: npm test
-
-      # `Check Version` decides; without this gate every push to main tries to
-      # publish, and fails whenever the version was not bumped.
       - name: Publish
         if: steps.check.outputs.should_publish == 'true'
         run: npm publish --provenance

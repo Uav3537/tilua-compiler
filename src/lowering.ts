@@ -26,6 +26,7 @@ import type { LoweringPlugin } from "@tilua/parser"
 // — without depending on the compiler that calls it.
 export type {
     LoweringPlugin, LuaSyntax, MethodCall, MethodLowering, GlobalCall, GlobalValue, CallLowering, CallSite, ArgumentInfo,
+    PluginContext, EntryExports, EntryExportsLowering, FilesLayout, FilesAnswer,
 } from "@tilua/parser"
 
 export interface LoadedLowering {
@@ -36,6 +37,9 @@ export interface LoadedLowering {
      *  analyzer was given: a method read from a metatable they declare is
      *  this lowering's to answer. Absent for the language's own. */
     readonly library?: number
+    /** The library's own options, as the config sets them. None for the
+     *  language's own. */
+    readonly options?: Readonly<Record<string, boolean | number | string | undefined>>
 }
 
 export interface LoweringProblem {
@@ -47,7 +51,7 @@ export interface LoweringProblem {
  *  or exports the wrong shape, is reported and skipped: the rest of the build
  *  is still worth having. */
 export async function loadLowerings(
-    modules: readonly { file: string; from: string; library?: number }[],
+    modules: readonly { file: string; from: string; library?: number; options?: LoadedLowering["options"] }[],
 ): Promise<{ lowerings: LoadedLowering[]; problems: LoweringProblem[] }> {
     const lowerings: LoadedLowering[] = []
     const problems: LoweringProblem[] = []
@@ -62,7 +66,7 @@ export async function loadLowerings(
                 })
                 continue
             }
-            lowerings.push({ plugin: plugin as LoweringPlugin, from: module.from, library: module.library })
+            lowerings.push({ plugin: plugin as LoweringPlugin, from: module.from, library: module.library, options: module.options })
         } catch (error) {
             problems.push({
                 file: module.file,
