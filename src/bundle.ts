@@ -84,7 +84,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs"
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve } from "node:path"
 import {
-    parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries, importExpressions,
+    parse, analyzeScopes, analyzeTypes, moduleExports, classesOf, exportsFingerprint, resolveModulePath, resolveTypeLibraries, importExpressions,
     sourceMapOf, sourceMapTypes, outputPathOf, type SourceMapTypes,
     directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, UNUSED_EXPECT_WARNING, ParseError, LexError, luauString,
     type ModuleExports, type Program, type ScopeAnalysis, type TiluaConfig, type TypeAnalysis, type Directives,
@@ -1409,7 +1409,15 @@ interface ModuleAnalysis {
     scopes: ScopeAnalysis
 }
 
-/** Every module's types, and its type errors, against the config's type libraries. */
+/** How many passes a cycle gets, should its exports never come to rest. */
+const MAX_CYCLE_PASSES = 6
+
+/** Every module's types, and its type errors, against the config's type libraries.
+ *
+ *  An import cycle can only be broken by letting one side see the other before
+ *  it is finished, as `any`, and a type crosses one such import per pass. So a
+ *  build that met a cycle goes again, reading the last pass's exports there,
+ *  until they come to rest: what the types come to is what the editor shows. */
 function analyzeModules(
     modules: SourceModule[],
     config: TiluaConfig | undefined,
@@ -1446,6 +1454,10 @@ function analyzeModules(
     /** How often a cycle has handed out partial exports. An analysis that saw
      *  one is not kept: what it read was not the whole module. */
     let partials = 0
+    /** Modules an import reached while they were still being analyzed. */
+    const cycles = new Set<string>()
+    /** Their exports as the pass before left them. */
+    const provisional = new Map<string, ModuleExports>()
     /** What each module read while it was analyzed — itself and, through its
      *  imports, every module below it. An analysis holds only as long as all
      *  of them are the files they were. */
@@ -1455,7 +1467,9 @@ function analyzeModules(
     const analyzeModule = (file: string, program: Program): ModuleAnalysis => {
         const done = analyzed.get(file)
         if (done) return done
-        const remembered = moduleAnalyses.get(file)
+        // Once a cycle is met, what stands was read through it: nothing is taken
+        // from a last build, or kept for the next.
+        const remembered = cycles.size ? undefined : moduleAnalyses.get(file)
         // The file's own `script`, where the tree has it.
         const script = scriptOf(file)
         const ownLibs = script ? [...libs, script] : libs
@@ -1492,6 +1506,8 @@ function analyzeModules(
         const result = { types, diagnostics: said, scopes }
         if (partials === before) {
             analyzed.set(file, result)
+        }
+        if (partials === before && !cycles.size) {
             const read = readWhile.get(file) ?? new Map<string, string>()
             const own = stampOf(file)
             if (own !== undefined) read.set(file, own)
@@ -1520,7 +1536,8 @@ function analyzeModules(
         }
         if (inProgress.has(target)) {
             partials++
-            return { values: new Map(), types: new Map(), partial: true }
+            cycles.add(target)
+            return provisional.get(target) ?? { values: new Map(), types: new Map(), partial: true }
         }
         const cached = exportsCache.get(target)
         if (cached) {
@@ -1550,11 +1567,6 @@ function analyzeModules(
         }
     }
 
-    for (const module of modules) {
-        const { types, diagnostics } = analyzeModule(module.file, module.program)
-        analyses.set(module.file, types)
-        out.push(...diagnostics)
-    }
     const exportsOf = (file: string): ModuleExports => {
         const cached = exportsCache.get(file)
         if (cached) return cached
@@ -1563,6 +1575,31 @@ function analyzeModules(
         const exports = moduleExports(module.program, scopes, types, resolverFor(file))
         exportsCache.set(file, exports)
         return exports
+    }
+
+    const reported = out.length
+    const libraryClasses = classesOf(libs)
+    const fingerprints = new Map<string, string | undefined>()
+    for (let pass = 1; ; pass++) {
+        out.length = reported
+        for (const module of modules) {
+            const { types, diagnostics } = analyzeModule(module.file, module.program)
+            analyses.set(module.file, types)
+            out.push(...diagnostics)
+        }
+        if (!cycles.size || pass === MAX_CYCLE_PASSES) break
+        let settled = pass > 1
+        for (const file of cycles) {
+            const exports = byFile.has(file) ? exportsOf(file) : exportsCache.get(file)
+            if (exports && !exports.partial) provisional.set(file, exports)
+            const fingerprint = exports && !exports.partial ? exportsFingerprint(exports, libraryClasses) : undefined
+            if (fingerprint === undefined || fingerprint !== fingerprints.get(file)) settled = false
+            fingerprints.set(file, fingerprint)
+        }
+        if (settled) break
+        analyzed.clear()
+        exportsCache.clear()
+        readWhile.clear()
     }
     return { types: analyses, diagnostics: out, lowerings: [...libraries.lowerings], exportsOf }
 }

@@ -2086,6 +2086,19 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
         `require("./src/shop/buy")\nprint(require("./_tilua").modules["src/shop/buy"].load)`)
     if (spent) check("files: a module's body is gone once it has run", spent, ["tax loaded", "buy loaded", "nil"])
 
+    // A type that crosses a cycle of three files reaches the far side, as it does
+    // in the editor: neither `any` that hides a real error nor one that makes one
+    const cycle = await bundle({
+        root: project({
+            "tilua.config.json": JSON.stringify({ types: [LUAU], output: "files", rootDir: "src" }),
+            "src/a.tilua": `import { fromC } from "./c"\nexport const fromA = { n: 1 }\nexport function good(): number { return fromC.n }\nexport function bad(): string { return fromC.n }\n`,
+            "src/b.tilua": `import { fromA } from "./a"\nexport const fromB = fromA\n`,
+            "src/c.tilua": `import { fromB } from "./b"\nexport const fromC = fromB\n`,
+        }),
+    })
+    check("types: a cycle's types settle before they are checked",
+        cycle.diagnostics.map(d => [basename(d.file), d.line, d.message.startsWith("Type 'number'") || d.message.includes("number")]), [["a.tilua", 4, true]])
+
     const configured = await bundle({ entry: join(project({ ...files, "tilua.config.json": JSON.stringify({ types: [], output: "chunks" }) }), "src/main.tilua") })
     check("output: the config's, without an option", configured.files.length, 5)
 
