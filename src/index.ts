@@ -10,5 +10,5 @@ export { lower, type LowerOptions, type LowerResult, type LowerDiagnostic, type 
 export { loadLowerings, type LoadedLowering, type LoweringProblem } from "./lowering.js"
 export type {
     LoweringPlugin, LuaSyntax, MethodCall, MethodLowering, PluginContext, EntryExports, EntryExportsLowering,
-    FilesLayout, FilesAnswer,
+    FilesLayout, FilesAnswer, FilesOutput, FilesProblem,
 } from "./lowering.js"

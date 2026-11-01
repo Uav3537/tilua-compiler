@@ -298,7 +298,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         for (let n = 2; taken.has(pathKey(runtimeFile)); n++) runtimeFile = join(outDir, `_tilua${n}.luau`)
         for (let i = lowerings.length - 1; i >= 0 && !host; i--) {
             const { plugin, options: own } = lowerings[i]
-            host = plugin.files?.({ options: own ?? {}, directory: config?.directory ?? root, outDir, files: outputs, runtime: runtimeFile })
+            host = plugin.files?.({ options: own ?? {}, directory: config?.directory ?? root, rootDir, outDir, files: outputs, runtime: runtimeFile })
         }
         for (const problem of host?.problems ?? []) {
             diagnostics.push({
@@ -350,6 +350,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         const dynamicImports = new Set<string>()
         const lowered = lower(source.program, source.scopes, {
             names,
+            perFile,
             types: analysis.types.get(file),
             lowerings,
             noLib: config?.noLib,
@@ -551,6 +552,23 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
         const runtimeCode = write(runtimeProgram)
         if (typeof runtimeCode !== "string") return unwritable(runtimeCode.problem)
         files.push({ path: runtimePath, code: `${runtimeCode}\n${WRITTEN_BY_TILUA}: the runtime every file of the project requires.\n`, modules: [] })
+        // What a library writes with the output: asked last, with every module
+        // lowered, so it knows what the program called.
+        try {
+            const more = await host?.output?.()
+            for (const { file, code } of more?.files ?? []) {
+                if (isOutside(outDir, resolve(file))) return stop(`A library's file has to go inside outDir, not at ${file}`)
+                files.push({ path: relative(outDir, file).replace(/\\/g, "/"), code: `${code}\n${WRITTEN_BY_TILUA}: a library's own file.\n`, modules: [] })
+            }
+            for (const problem of more?.problems ?? []) {
+                diagnostics.push({
+                    file: problem.file ?? config?.path ?? anchor, message: problem.message, line: 1, column: 1, category: "config",
+                    ...(problem.severity === "warning" && { severity: "warning" as const }),
+                })
+            }
+        } catch (error) {
+            return stop(`A library could not write its files: ${(error as Error).message}`)
+        }
         return { code: files[0].code, files, modules: moduleNames, diagnostics }
     }
 
@@ -1244,7 +1262,11 @@ ${several ? `
         })
         record = { loading = true, exports = exports }
         ${G}.records[name] = record
-        module.load(exports)
+        -- A module runs once, so nothing keeps its body: anything can reach
+        -- this table, and the body holds what the file kept to itself.
+        local run = module.load
+        module.load = nil
+        run(exports)
         record.loading = false
         return exports
     end,

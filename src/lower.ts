@@ -74,6 +74,8 @@ export interface ModuleContext {
 }
 
 export interface LowerOptions {
+    /** The build is `"output": "files"`, as a library is told. */
+    readonly perFile?: boolean
     /** Lower the file as a module of a bundle. Without it, `import` and
      *  `export` are errors. */
     readonly module?: ModuleContext
@@ -707,6 +709,8 @@ class Lowerer {
                 receiverGlobal,
                 argumentCount: args.length,
                 at: this.callSite(name),
+                perFile: this.options.perFile ?? false,
+                report: message => this.diagnostics.push({ message, line: node.line.start, column: node.column.start }),
                 get arguments() { return info() },
                 use: runtime => this.loweringRuntime(i, runtime),
             })
@@ -735,6 +739,8 @@ class Lowerer {
                 options: lowerings[i].options ?? {},
                 name,
                 at: this.callSite(node.callee),
+                perFile: this.options.perFile ?? false,
+                report: message => this.diagnostics.push({ message, line: node.line.start, column: node.column.start }),
                 get arguments() { return info() },
                 use: runtime => this.loweringRuntime(i, runtime),
             })
@@ -749,11 +755,16 @@ class Lowerer {
         if (!lowerings?.some(l => l.plugin.globalValue)) return undefined
         const name = this.globalName(node)
         if (name === undefined) return undefined
+        const called = this.readingCallee
         for (let i = lowerings.length - 1; i >= 0; i--) {
             const answer = lowerings[i].plugin.globalValue?.({
                 options: lowerings[i].options ?? {},
                 name,
                 at: this.callSite(node),
+                perFile: this.options.perFile ?? false,
+                report: message => {
+                    if (!called) this.diagnostics.push({ message, line: node.line.start, column: node.column.start })
+                },
                 use: runtime => this.loweringRuntime(i, runtime),
             })
             if (answer !== undefined) return this.libraryExpression(answer, i, node)
@@ -2376,8 +2387,17 @@ end
         if (node.type === "CallExpression" && object.type === "Identifier") {
             return this.link(node, this.reference(object))
         }
-        return this.link(node, this.expression(object))
+        // `bridge.send(x)` is asked of `globalValue` on its way to `globalCall`,
+        // which then answers instead: that read is no read of the value.
+        const callee = node.type === "CallExpression" && node.callee === object
+        const reading = this.readingCallee
+        this.readingCallee = callee
+        const lowered = this.expression(object)
+        this.readingCallee = reading
+        return this.link(node, lowered)
     }
+
+    private readingCallee = false
 
     /** A call is one value in tilua, and Luau would hand on every value one
      *  returns in the last place of an argument list or a `return`: it is

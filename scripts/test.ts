@@ -2082,6 +2082,9 @@ function runFiles(name: string, result: BundleResult, binary: string | undefined
     const direct = runFiles("files: any file is one a script can require", perFile, luauBinary,
         `local buy = require("./src/shop/buy")\nprint(buy.price("hat"), buy.default, require("./src/shop/buy") == buy)`)
     if (direct) check("files: any file is one a script can require, and gets its exports", direct, ["tax loaded", "buy loaded", "27\tshop\ttrue"])
+    const spent = runFiles("files: a module's body is gone once it has run", perFile, luauBinary,
+        `require("./src/shop/buy")\nprint(require("./_tilua").modules["src/shop/buy"].load)`)
+    if (spent) check("files: a module's body is gone once it has run", spent, ["tax loaded", "buy loaded", "nil"])
 
     const configured = await bundle({ entry: join(project({ ...files, "tilua.config.json": JSON.stringify({ types: [], output: "chunks" }) }), "src/main.tilua") })
     check("output: the config's, without an option", configured.files.length, 5)
