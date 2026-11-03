@@ -546,12 +546,12 @@ a script that requires any of them knows what it got.
 <!-- compatibility:start -->
 ## Compatibility
 
-`@tilua/compiler@9.1.3` works with these tilua packages. *Released with* is the
+`@tilua/compiler@9.1.4` works with these tilua packages. *Released with* is the
 version it was built and tested against.
 
 | Package | Range | Released with | |
 | --- | --- | --- | --- |
-| `@tilua/parser` | `^9.1.3` | 9.1.3 | dependency |
+| `@tilua/parser` | `^9.1.4` | 9.1.4 | dependency |
 <!-- compatibility:end -->
 
 ## Development
